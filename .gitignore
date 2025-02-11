@@ -1,0 +1,7 @@
+*.xlsx
+*.docx
+*.xlsm
+credentials.json
+*.log
+
+
