@@ -1,0 +1,7 @@
+Windows Registry Editor Version 5.00
+
+[-HKEY_CLASSES_ROOT\SystemFileAssociations\.gdoc\shell\DownloadAsOffice]
+
+[-HKEY_CLASSES_ROOT\SystemFileAssociations\.gsheet\shell\DownloadAsOffice]
+
+[-HKEY_CLASSES_ROOT\SystemFileAssociations\.gslides\shell\DownloadAsOffice]
