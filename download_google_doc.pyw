@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import glob
+import math
 import logging
 import argparse
 from datetime import datetime, timedelta
@@ -21,7 +22,7 @@ log_file = os.path.join(SCRIPT_DIR, "download_google_doc.log")
 logging.basicConfig(filename=log_file, level=logging.INFO, 
                     format='%(asctime)s %(levelname)s: %(message)s')
 
-# Global cache to store folder IDs (to reduce redundant API calls)
+# Global cache to store folder IDs (and folder metadata for shared files)
 folder_cache = {}
 
 # Define the path to client_secrets.json
@@ -98,7 +99,6 @@ def parse_date_input(date_str):
     if not date_str.startswith('-'):
         try:
             dt = date_parser.parse(date_str)
-            # If dt is naive, assume local time then convert to UTC
             if dt.tzinfo is None:
                 dt = dt.astimezone().astimezone(tz=timedelta(0))
             else:
@@ -108,7 +108,6 @@ def parse_date_input(date_str):
             print(f"Error parsing date '{date_str}': {e}")
             sys.exit(1)
     else:
-        # Interpret as a relative time offset from now.
         rel = date_str[1:].strip()
         m = re.match(r"(\d+)\s*([smhdw]?)", rel)
         if m:
@@ -134,28 +133,27 @@ def parse_date_input(date_str):
             sys.exit(1)
 
 def find_folder_id(drive_path):
-    """Find the folder ID in Google Drive based on the relative path from root.
-       Uses a global cache to avoid repeated API calls."""
+    """
+    Find the folder ID in Google Drive based on the relative path from root.
+    Uses a global cache to avoid repeated API calls.
+    """
     global folder_cache
     if not drive_path or drive_path == ".":
         return 'root'
     if drive_path in folder_cache:
         return folder_cache[drive_path]
-
     folder_id = 'root'
     for folder_name in drive_path.split(os.path.sep):
         if not folder_name:
             continue
         logging.info(f"Looking for folder: {folder_name}")
         print(f"📂 Looking for folder: {folder_name}")
-
         if folder_name.startswith('.shortcut-targets-by-id'):
             target_id = folder_name.split('-')[-1]
             logging.info(f"Using shortcut target ID: {target_id}")
             print(f"🔗 Using shortcut target ID: {target_id}")
             folder_id = target_id
             continue
-
         query = f"'{folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and title='{folder_name}'"
         file_list = drive.ListFile({'q': query}).GetList()
         if not file_list:
@@ -165,7 +163,6 @@ def find_folder_id(drive_path):
         folder_id = file_list[0]['id']
         logging.info(f"Found folder '{folder_name}', ID: {folder_id}")
         print(f"✅ Found folder '{folder_name}', ID: {folder_id}")
-
     folder_cache[drive_path] = folder_id
     return folder_id
 
@@ -178,13 +175,15 @@ def strip_duplicate_suffix(filename):
 
 def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, max_depth=float('inf'),
                         newer_than=None, older_than=None):
-    """Find Google Docs/Sheets/Slides files recursively. Groups files by title and recurses into subfolders."""
+    """
+    Find Google Docs/Sheets/Slides files recursively.
+    Groups files by title and recurses into subfolders.
+    """
     mime_types = {
         'application/vnd.google-apps.document',
         'application/vnd.google-apps.spreadsheet',
         'application/vnd.google-apps.presentation',
     }
-    
     query = f"'{folder_id}' in parents and trashed=false"
     if filename:
         base_filename = strip_duplicate_suffix(filename)
@@ -193,18 +192,13 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
         query += f" and modifiedDate > '{newer_than}'"
     if older_than:
         query += f" and modifiedDate < '{older_than}'"
-
     file_list = drive.ListFile({'q': query}).GetList()
     matching_files = [f for f in file_list if f['mimeType'] in mime_types]
     folders = [f for f in file_list if f['mimeType'] == 'application/vnd.google-apps.folder']
-
-    # Group matching files by title
     files_by_title = {}
     for file in matching_files:
         title = file['title']
         files_by_title.setdefault(title, []).append(file)
-
-    # Sort each group by createdDate and add a suffix for duplicates
     for title, files in files_by_title.items():
         files.sort(key=lambda x: x.get('createdDate', ''))
         for i, f in enumerate(files):
@@ -212,8 +206,6 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
             files_by_title[title][i] = (f['id'], suffix, f['mimeType'], base_path, f)
             logging.info(f"File '{title}{suffix}', ID: {f['id']}, MIME: {f['mimeType']}, Path: {base_path}, Created: {f.get('createdDate', 'N/A')}")
             print(f"✅ File '{title}{suffix}', ID: {f['id']}, MIME: {f['mimeType']}, Path: {base_path}, Created: {f.get('createdDate', 'N/A')}")
-
-    # Recurse into subfolders if depth is less than max_depth
     if depth < max_depth:
         for folder in folders:
             subfolder_id = folder['id']
@@ -225,59 +217,217 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
                                                   depth + 1, max_depth, newer_than, older_than)
             for title, file_entries in subfolder_files.items():
                 files_by_title.setdefault(title, []).extend(file_entries)
-
     total_files = sum(len(files) for files in files_by_title.values())
     logging.info(f"Found {total_files} Google Docs/Sheets/Slides files in folder ID '{folder_id}' (depth {depth}).")
     print(f"✅ Found {total_files} Google Docs/Sheets/Slides files at depth {depth}.")
     return files_by_title
 
+def get_file_drive_path(file_meta):
+    """
+    Given a file's metadata (which should include a 'parents' field),
+    compute a relative folder path representing its location in Drive.
+    If the top-level folder is "My Drive", it is removed; otherwise,
+    "Shared With Me" is prepended.
+    Folder names are sanitized for OS compatibility.
+    """
+    parents = file_meta.get("parents", [])
+    if not parents:
+        return ""
+    parent_id = parents[0]["id"] if isinstance(parents[0], dict) else parents[0]
+    path_parts = []
+    while parent_id and parent_id != "root":
+        if parent_id in folder_cache:
+            folder_info = folder_cache[parent_id]
+        else:
+            folder = drive.CreateFile({'id': parent_id})
+            folder.FetchMetadata(fields="id,title,parents")
+            folder_info = {
+                "title": folder["title"],
+                "parents": folder.get("parents", [])
+            }
+            folder_cache[parent_id] = folder_info
+        sanitized_title = sanitize_filename(folder_info["title"])
+        path_parts.append(sanitized_title)
+        if folder_info["parents"]:
+            parent_id = folder_info["parents"][0]["id"] if isinstance(folder_info["parents"][0], dict) else folder_info["parents"][0]
+        else:
+            break
+    reversed_path = list(reversed(path_parts))
+    if reversed_path:
+        if reversed_path[0] == "My Drive":
+            reversed_path = reversed_path[1:]
+        else:
+            reversed_path.insert(0, "Shared With Me")
+    if not reversed_path:
+        return ""
+    return os.path.join(*reversed_path)
+
 def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp, 
-                                      output_directory, dry_run=False, file_meta=None):
-    """Download a Google file as an MS Office document, preserving the subfolder structure.
-       Uses provided metadata if available to avoid extra API calls."""
+                                      output_directory, dry_run=False, file_meta=None,
+                                      prune_newest=None, prune_staggered=None, no_clobber=False):
+    """
+    Download a Google file as an MS Office document, preserving the subfolder structure.
+    
+    Version control behavior:
+      - If the plain target file (BaseName.ext) already exists and --no-clobber is set,
+        the download is skipped.
+      - Otherwise, if --timestamp is not specified and the plain target exists, it is renamed
+        into a backup file (appending a timestamp from its OS modified time).
+      - Then, the new file is downloaded:
+           • If --timestamp is specified, the new file's name includes the current timestamp.
+           • Otherwise, it is downloaded as the plain file name (which overwrites by default).
+      - If --staggered or --newest are specified, existing backups (matching BaseName_*.ext)
+        are pruned accordingly.
+    """
     meta = file_meta if file_meta else drive.CreateFile({'id': file_id}).FetchMetadata()
     logging.info(f"Retrieved file: {meta['title']} (ID: {file_id}, MIME: {meta['mimeType']})")
     print(f"📄 Found File: {meta['title']} (ID: {file_id})")
     print(f"🔍 MIME Type: {meta['mimeType']}")
+    
     export_mimetype = get_export_mimetype(meta['mimeType'])
     if export_mimetype is None:
         logging.error(f"Unsupported MIME type: {meta['mimeType']}")
         print("⚠️  Unsupported Google Workspace file type.")
         return
-    original_extension = f".{get_original_extension(mime_type)}"
-    file_extension = get_export_extension(export_mimetype)
-    timestamp = "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") if add_timestamp else ""
+
+    orig_ext = get_original_extension(mime_type)  # e.g. "gsheet"
+    file_extension = get_export_extension(export_mimetype)  # e.g. "xlsx"
     full_output_directory = os.path.join(output_directory, subfolder_path)
     if not dry_run:
         os.makedirs(full_output_directory, exist_ok=True)
-    output_filename = os.path.join(full_output_directory,
-                                   f"{sanitize_filename(meta['title'])}{suffix}{original_extension}{timestamp}.{file_extension}")
-    logging.info(f"{'[Dry Run] Would download' if dry_run else 'Downloading'} to: {output_filename}")
-    print(f"{'📜 [Dry Run] Would save' if dry_run else '⬇️  Saving'} as: {output_filename}")
+    # Construct base_name (without any timestamp)
+    base_name = f"{sanitize_filename(meta['title'])}{suffix}{'.' + orig_ext}"
+    
+    # Determine target file names:
+    plain_target = os.path.join(full_output_directory, f"{base_name}.{file_extension}")
+    if add_timestamp:
+        current_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        new_file_name = f"{base_name}_{current_timestamp}.{file_extension}"
+    else:
+        new_file_name = f"{base_name}.{file_extension}"
+    new_target = os.path.join(full_output_directory, new_file_name)
+    
+    # If --no-clobber is specified and the plain target exists, skip downloading.
+    if no_clobber and os.path.exists(plain_target):
+        logging.info(f"Skipping download because {plain_target} exists (--no-clobber enabled)")
+        print(f"⏩ Skipping download: {plain_target} exists")
+        return
+    
+    # If not using --timestamp and plain_target exists, rename it to a backup using its OS modification time.
+    if not add_timestamp and os.path.exists(plain_target):
+        mod_time = os.path.getmtime(plain_target)
+        mod_dt = datetime.fromtimestamp(mod_time)
+        mod_timestamp = mod_dt.strftime("%Y-%m-%d_%H-%M-%S")
+        backup_name = f"{base_name}_{mod_timestamp}.{file_extension}"
+        backup_path = os.path.join(full_output_directory, backup_name)
+        if not dry_run:
+            os.rename(plain_target, backup_path)
+        logging.info(f"Renamed existing file {plain_target} to backup {backup_path}")
+        print(f"🗑 Renamed existing file to backup: {backup_path}")
+    
+    # Download the new file.
+    logging.info(f"{'[Dry Run] Would download' if dry_run else 'Downloading'} to: {new_target}")
+    print(f"{'📜 [Dry Run] Would save' if dry_run else '⬇️  Saving'} as: {new_target}")
     if not dry_run:
         file_to_download = drive.CreateFile({'id': file_id})
-        file_to_download.GetContentFile(output_filename, mimetype=export_mimetype)
-        logging.info(f"Download successful: {output_filename}")
-        print(f"✅ File downloaded successfully: {output_filename}")
+        file_to_download.GetContentFile(new_target, mimetype=export_mimetype)
+        logging.info(f"Download successful: {new_target}")
+        print(f"✅ File downloaded successfully: {new_target}")
+    
+    # --- Backup Pruning: only if versioning options are specified ---
+    if prune_newest is not None or prune_staggered is not None:
+        pattern = os.path.join(full_output_directory, f"{base_name}_*.{file_extension}")
+        existing_backups = glob.glob(pattern)
+        ts_regex = re.compile(rf"^{re.escape(base_name)}_(\d{{4}}-\d{{2}}-\d{{2}}_\d{{2}}-\d{{2}}-\d{{2}})\.{re.escape(file_extension)}$")
+        backups_with_ts = []
+        for f in existing_backups:
+            m = ts_regex.match(os.path.basename(f))
+            if m:
+                ts_str = m.group(1)
+                try:
+                    ts = datetime.strptime(ts_str, "%Y-%m-%d_%H-%M-%S")
+                    backups_with_ts.append((f, ts))
+                except Exception as e:
+                    logging.warning(f"Failed to parse timestamp from {f}: {e}")
+        if prune_newest is not None:
+            backups_with_ts.sort(key=lambda x: x[1], reverse=True)
+            if len(backups_with_ts) > prune_newest:
+                for f, ts in backups_with_ts[prune_newest:]:
+                    if not dry_run:
+                        os.remove(f)
+                    logging.info(f"Pruned old backup (newest mode): {f}")
+                    print(f"🗑 Pruned old backup (newest): {f}")
+        elif prune_staggered is not None:
+            backups_with_ts.sort(key=lambda x: x[1])
+            m_val = len(backups_with_ts)
+            n_val = prune_staggered
+            if m_val > n_val:
+                if n_val == 1:
+                    keep_indices = [m_val - 1]
+                else:
+                    keep_indices = []
+                    for i in range(n_val):
+                        if i == 0:
+                            keep_indices.append(0)
+                        elif i == n_val - 1:
+                            keep_indices.append(m_val - 1)
+                        else:
+                            idx = int(round(math.exp((math.log(m_val - 1)) * i / (n_val - 1))))
+                            idx = min(max(idx, 0), m_val - 1)
+                            keep_indices.append(idx)
+                    keep_indices = sorted(set(keep_indices))
+                files_to_keep = {backups_with_ts[i][0] for i in keep_indices}
+                for f, ts in backups_with_ts:
+                    if f not in files_to_keep:
+                        if not dry_run:
+                            os.remove(f)
+                        logging.info(f"Pruned old backup (staggered mode): {f}")
+                        print(f"🗑 Pruned old backup (staggered): {f}")
 
-def find_deepest_match(file_path, backup_path):
-    """Find the deepest matching folder component between the file path and backup path, starting from the root."""
-    file_parts = os.path.normpath(file_path).split(os.sep)
-    backup_parts = os.path.normpath(backup_path).split(os.sep)
-    match_index = -1
-    for i in range(min(len(file_parts), len(backup_parts))):
-        if file_parts[i] != backup_parts[i]:
-            break
-        match_index = i
-    if match_index < 0:
-        logging.warning(f"No matching component found between '{file_path}' and '{backup_path}'.")
-        print(f"⚠️  No matching component found between '{file_path}' and backup '{backup_path}'.")
-        return backup_path
-    remaining_part = os.path.join(*file_parts[match_index + 1:]) if (match_index + 1) < len(file_parts) else ""
-    new_path = os.path.join(backup_path, remaining_part)
-    return new_path
+def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than, title_filter, prune_newest, prune_staggered, no_clobber):
+    """
+    Perform a global search over the entire Drive using date filters and an optional title filter.
+    For each file, the folder hierarchy is computed so that the file is downloaded into the appropriate
+    subfolder under the backup path.
+    """
+    mime_types = (
+        "mimeType = 'application/vnd.google-apps.document' or "
+        "mimeType = 'application/vnd.google-apps.spreadsheet' or "
+        "mimeType = 'application/vnd.google-apps.presentation'"
+    )
+    query = f"trashed=false and ({mime_types})"
+    if title_filter:
+        query += f" and title='{title_filter}'"
+    if newer_than:
+        query += f" and modifiedDate > '{newer_than}'"
+    if older_than:
+        query += f" and modifiedDate < '{older_than}'"
+    
+    file_list = drive.ListFile({'q': query}).GetList()
+    output_directory = os.path.abspath(backup_path) if backup_path else os.getcwd()
+    if not dry_run:
+        os.makedirs(output_directory, exist_ok=True)
+    if backup_path:
+        logging.info(f"Redirecting download to: {output_directory}")
+        print(f"📁 Redirecting download to: {output_directory}")
+    for file in file_list:
+        subfolder_path = get_file_drive_path(file)
+        suffix = ""
+        download_google_file_as_ms_office(
+            file_id=file['id'],
+            suffix=suffix,
+            mime_type=file['mimeType'],
+            subfolder_path=subfolder_path,
+            add_timestamp=add_timestamp,
+            output_directory=output_directory,
+            dry_run=dry_run,
+            file_meta=file,
+            prune_newest=prune_newest,
+            prune_staggered=prune_staggered,
+            no_clobber=no_clobber
+        )
 
-def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than):
+def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than, prune_newest, prune_staggered, no_clobber):
     """Process a single input path (file or directory)."""
     input_path = os.path.abspath(input_path)
     mime_type_map = {
@@ -293,7 +443,7 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             folder_id = find_folder_id(drive_path)
             files_by_title = find_files_in_drive(drive, folder_id, max_depth=max_depth,
                                                  newer_than=newer_than, older_than=older_than)
-            output_directory = input_path if not backup_path else find_deepest_match(input_path, os.path.abspath(backup_path))
+            output_directory = input_path if not backup_path else os.path.abspath(backup_path)
             if output_directory:
                 if not dry_run:
                     os.makedirs(output_directory, exist_ok=True)
@@ -307,7 +457,8 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             for title, file_entries in files_by_title.items():
                 for file_id, suffix, mime_type, subfolder_path, file_meta in file_entries:
                     download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
-                                                      output_directory, dry_run, file_meta)
+                                                      output_directory, dry_run, file_meta,
+                                                      prune_newest, prune_staggered, no_clobber)
         else:
             if not os.path.exists(input_path):
                 logging.error(f"File does not exist: {input_path}")
@@ -325,7 +476,7 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             folder_id = find_folder_id(drive_path)
             files_by_title = find_files_in_drive(drive, folder_id, filename=filename,
                                                  max_depth=max_depth, newer_than=newer_than, older_than=older_than)
-            output_directory = folder_path if not backup_path else find_deepest_match(folder_path, os.path.abspath(backup_path))
+            output_directory = folder_path if not backup_path else os.path.abspath(backup_path)
             if output_directory:
                 if not dry_run:
                     os.makedirs(output_directory, exist_ok=True)
@@ -340,7 +491,8 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             if base_filename in files_by_title:
                 for file_id, suffix, mime_type, subfolder_path, file_meta in files_by_title[base_filename]:
                     download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
-                                                      output_directory, dry_run, file_meta)
+                                                      output_directory, dry_run, file_meta,
+                                                      prune_newest, prune_staggered, no_clobber)
             else:
                 logging.error(f"File '{base_filename}' not found in Google Drive.")
                 print(f"⚠️  File '{base_filename}' not found in Google Drive.")
@@ -348,127 +500,37 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
         logging.exception(f"Processing failed for {input_path}")
         print(f"⚠️  Processing failed for {input_path}: {e}")
 
-def get_file_drive_path(file_meta):
-    """
-    Given a file's metadata (which should include a 'parents' field),
-    compute a relative folder path representing its location in Drive.
-    If the top-level folder is "My Drive", it is removed; otherwise, 
-    "Shared With Me" is prepended.
-    """
-    parents = file_meta.get("parents", [])
-    if not parents:
-        return ""
-    # Use the first parent ID.
-    parent_id = parents[0]["id"] if isinstance(parents[0], dict) else parents[0]
-    path_parts = []
-    # Walk up the folder tree until reaching the root.
-    while parent_id and parent_id != "root":
-        if parent_id in folder_cache:
-            folder_info = folder_cache[parent_id]
-        else:
-            folder = drive.CreateFile({'id': parent_id})
-            folder.FetchMetadata(fields="id,title,parents")
-            folder_info = {
-                "title": folder["title"],
-                "parents": folder.get("parents", [])
-            }
-            folder_cache[parent_id] = folder_info
-        path_parts.append(folder_info["title"])
-        if folder_info["parents"]:
-            parent_id = folder_info["parents"][0]["id"] if isinstance(folder_info["parents"][0], dict) else folder_info["parents"][0]
-        else:
-            break
-    # Reverse the list so the path starts from the top.
-    reversed_path = list(reversed(path_parts))
-    if reversed_path:
-        if reversed_path[0] == "My Drive":
-            # Remove "My Drive" from the path.
-            reversed_path = reversed_path[1:]
-        else:
-            # For files not in "My Drive", assume they are in a shared folder.
-            reversed_path.insert(0, "Shared With Me")
-    if not reversed_path:
-        return ""
-    return os.path.join(*reversed_path)
-
-
-def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than, title_filter):
-    """
-    Perform a global search over the entire Drive using date filters and an optional title filter.
-    The query is built without a folder constraint, so files matching the criteria from anywhere in Drive are returned.
-    For each file, the folder hierarchy is computed from its parents so that it is downloaded into the appropriate
-    subfolder under the backup path.
-    """
-    # Build a query that omits any "in parents" clause.
-    mime_types = (
-        "mimeType = 'application/vnd.google-apps.document' or "
-        "mimeType = 'application/vnd.google-apps.spreadsheet' or "
-        "mimeType = 'application/vnd.google-apps.presentation'"
-    )
-    query = f"trashed=false and ({mime_types})"
-    if title_filter:
-        query += f" and title='{title_filter}'"
-    if newer_than:
-        query += f" and modifiedDate > '{newer_than}'"
-    if older_than:
-        query += f" and modifiedDate < '{older_than}'"
-    
-    file_list = drive.ListFile({'q': query}).GetList()
-    
-    output_directory = os.path.abspath(backup_path) if backup_path else os.getcwd()
-    if not dry_run:
-        os.makedirs(output_directory, exist_ok=True)
-    if backup_path:
-        logging.info(f"Redirecting download to: {output_directory}")
-        print(f"📁 Redirecting download to: {output_directory}")
-    
-    for file in file_list:
-        # Compute the relative folder path from the file's parent metadata.
-        subfolder_path = get_file_drive_path(file)
-        # For simplicity, we assign an empty suffix (you could add duplicate handling if needed)
-        suffix = ""
-        download_google_file_as_ms_office(
-            file_id=file['id'],
-            suffix=suffix,
-            mime_type=file['mimeType'],
-            subfolder_path=subfolder_path,
-            add_timestamp=add_timestamp,
-            output_directory=output_directory,
-            dry_run=dry_run,
-            file_meta=file
-        )
-
-
-
 def parse_arguments():
-    """Parse command line arguments using argparse for better robustness."""
+    """Parse command line arguments using argparse."""
     parser = argparse.ArgumentParser(description="Download Google Docs/Sheets/Slides as Office files.")
-    # Make paths optional (nargs="*")
     parser.add_argument("paths", nargs="*", help="Local input file or directory paths (wildcards supported). Leave empty for a global Drive search.")
-    parser.add_argument("--timestamp", action="store_true", help="Append timestamp to output filename.")
+    parser.add_argument("--timestamp", action="store_true", help="Append timestamp to new file name.")
     parser.add_argument("--backup", type=str, help="Redirect downloads to backup path.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate download without writing files.")
     parser.add_argument("--max-depth", type=int, default=float('inf'), help="Maximum recursion depth for folder search.")
-    parser.add_argument("--newer-than", type=str, help="Filter files newer than given date. Accepts absolute dates (e.g., '2023-01-01T00:00:00') or relative times (e.g., '-1d', '-3600').")
+    parser.add_argument("--newer-than", type=str, help="Filter files newer than given date. Accepts absolute dates or relative times (e.g. '-1d').")
     parser.add_argument("--older-than", type=str, help="Filter files older than given date. Accepts absolute dates or relative times.")
     parser.add_argument("--title", type=str, help="Search for files with a specific title.")
+    parser.add_argument("--staggered", type=int, help="Retain up to <n> timestamped backups in staggered mode.")
+    parser.add_argument("--newest", type=int, help="Retain up to <n> most recent timestamped backups.")
+    parser.add_argument("--no-clobber", action="store_true", help="Do not re-download if the target file already exists.")
     return parser.parse_args()
 
 def main():
     print("🚀 Script started!")
     args = parse_arguments()
-    # Process date arguments into RFC 3339 format
     if args.newer_than:
         args.newer_than = parse_date_input(args.newer_than)
     if args.older_than:
         args.older_than = parse_date_input(args.older_than)
-    # If no input paths are provided, perform a global search.
+    prune_newest = args.newest if args.newest is not None else None
+    prune_staggered = None if prune_newest is not None else args.staggered
+
     if not args.paths:
         print("No input paths provided. Performing a global search on your Drive.")
         process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
-                              args.newer_than, args.older_than, args.title)
+                              args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
     else:
-        # Expand wildcards for input paths
         input_paths = []
         for path in args.paths:
             expanded = glob.glob(path.strip('"'))
@@ -478,7 +540,7 @@ def main():
                 input_paths.append(path.strip('"'))
         for input_path in input_paths:
             process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
-                         args.newer_than, args.older_than)
+                         args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
     print("✅ Script completed!")
 
 if __name__ == "__main__":
