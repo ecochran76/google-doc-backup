@@ -3,5 +3,7 @@
 *.xlsm
 credentials.json
 *.log
+*.reg
+
 
 

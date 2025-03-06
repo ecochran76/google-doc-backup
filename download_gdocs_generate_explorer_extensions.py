@@ -8,71 +8,96 @@ SCRIPT_NAME = "download_google_doc.pyw"
 REG_FILE_NAME = "add_context_menu.reg"
 REMOVE_REG_FILE_NAME = "remove_context_menu.reg"
 
-# Get paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT_PATH = os.path.join(SCRIPT_DIR, SCRIPT_NAME)
+# Registry formatting constants
+ESCAPED_QUOTE = '\\"'  # Represents \" in the .reg file
 
-# Find the correct `pythonw.exe` location
-PYTHONW_PATH = shutil.which("pythonw")
-if not PYTHONW_PATH:
-    print("⚠️  Could not find pythonw.exe. Make sure Python is installed and added to PATH.")
-    sys.exit(1)
+# Helper Functions
+def escape_registry_path(path):
+    """Escape a path for use in a Windows registry .reg file, excluding outer quotes."""
+    return path.replace('"', ESCAPED_QUOTE).replace("\\", "\\\\")
 
-# Generate the .reg file content
-REG_CONTENT = f"""Windows Registry Editor Version 5.00
+def build_command_string(executable_path, script_path):
+    """Build a properly quoted and escaped command string for the registry."""
+    escaped_exec = escape_registry_path(executable_path)
+    escaped_script = escape_registry_path(script_path)
+    # Build the command with outer quotes and escaped inner quotes
+    return f'"{ESCAPED_QUOTE}{escaped_exec}{ESCAPED_QUOTE} {ESCAPED_QUOTE}{escaped_script}{ESCAPED_QUOTE} {ESCAPED_QUOTE}%1{ESCAPED_QUOTE}"'
 
-[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gdoc\\shell\\DownloadAsOffice]
-@="Download as Office File"
+def create_registry_entry(file_extension, menu_text, command_string):
+    """Create a registry entry for a given file extension."""
+    return f"""[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.{file_extension}\\shell\\DownloadAsOffice]
+@="{menu_text}"
 
-[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gdoc\\shell\\DownloadAsOffice\\command]
-@="\\"{PYTHONW_PATH}\\" \\"{SCRIPT_PATH}\\" \\"%1\\""
-
-[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gsheet\\shell\\DownloadAsOffice]
-@="Download as Office File"
-
-[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gsheet\\shell\\DownloadAsOffice\\command]
-@="\\"{PYTHONW_PATH}\\" \\"{SCRIPT_PATH}\\" \\"%1\\""
-
-[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gslides\\shell\\DownloadAsOffice]
-@="Download as Office File"
-
-[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gslides\\shell\\DownloadAsOffice\\command]
-@="\\"{PYTHONW_PATH}\\" \\"{SCRIPT_PATH}\\" \\"%1\\""
+[HKEY_CLASSES_ROOT\\SystemFileAssociations\\.{file_extension}\\shell\\DownloadAsOffice\\command]
+@={command_string}
 """
 
-# Generate the removal .reg file
-REMOVE_REG_CONTENT = """Windows Registry Editor Version 5.00
-
-[-HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gdoc\\shell\\DownloadAsOffice]
-
-[-HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gsheet\\shell\\DownloadAsOffice]
-
-[-HKEY_CLASSES_ROOT\\SystemFileAssociations\\.gslides\\shell\\DownloadAsOffice]
+def create_removal_entry(file_extension):
+    """Create a registry removal entry for a given file extension."""
+    return f"""[-HKEY_CLASSES_ROOT\\SystemFileAssociations\\.{file_extension}\\shell\\DownloadAsOffice]
 """
 
-# Write the `.reg` files
 def write_reg_file(filename, content):
-    """Writes a .reg file with the given content."""
+    """Write content to a .reg file."""
     with open(filename, "w", encoding="utf-8") as reg_file:
-        reg_file.write(content)
+        reg_file.write(content.strip() + "\n")
 
-write_reg_file(REG_FILE_NAME, REG_CONTENT)
-write_reg_file(REMOVE_REG_FILE_NAME, REMOVE_REG_CONTENT)
+# Main Logic
+def main():
+    # Get paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_path = os.path.join(script_dir, SCRIPT_NAME)
 
-print(f"✅ Successfully generated {REG_FILE_NAME} and {REMOVE_REG_FILE_NAME}")
+    # Find pythonw.exe
+    pythonw_path = shutil.which("pythonw")
+    if not pythonw_path:
+        print("⚠️  Could not find pythonw.exe. Make sure Python is installed and added to PATH.")
+        sys.exit(1)
 
-# Ask to apply the registry changes
-apply_now = input("Would you like to apply the registry changes now? (y/n): ").strip().lower()
+    # Verify script exists
+    if not os.path.exists(script_path):
+        print(f"⚠️  Script not found at: {script_path}")
+        sys.exit(1)
 
-if apply_now == "y":
-    try:
-        subprocess.run(["regedit.exe", "/s", REG_FILE_NAME], check=True)
-        print("✅ Context menu added successfully! Right-click any .gdoc, .gsheet, or .gslides file to use it.")
-    except Exception as e:
-        print(f"⚠️  Failed to apply registry changes: {e}")
-else:
-    print("ℹ️  You can manually apply the context menu by double-clicking the generated .reg file.")
+    # Build the command string
+    command_string = build_command_string(pythonw_path, script_path)
 
-# Ask if user wants to enable removal option
-print("\nTo remove the context menu later, run:")
-print(f"  regedit.exe /s {REMOVE_REG_FILE_NAME}")
+    # File extensions to configure
+    file_extensions = ["gdoc", "gsheet", "gslides"]
+    menu_text = "Download as Office File"
+
+    # Generate .reg content
+    reg_content = "Windows Registry Editor Version 5.00\n\n"
+    for ext in file_extensions:
+        reg_content += create_registry_entry(ext, menu_text, command_string)
+
+    # Generate removal .reg content
+    remove_reg_content = "Windows Registry Editor Version 5.00\n\n"
+    for ext in file_extensions:
+        remove_reg_content += create_removal_entry(ext)
+
+    # Write the files
+    write_reg_file(REG_FILE_NAME, reg_content)
+    write_reg_file(REMOVE_REG_FILE_NAME, remove_reg_content)
+
+    # Output results
+    print(f"✅ Successfully generated {os.path.abspath(REG_FILE_NAME)}")
+    print(f"✅ Successfully generated {os.path.abspath(REMOVE_REG_FILE_NAME)}")
+
+    # Ask to apply changes
+    apply_now = input("Would you like to apply the registry changes now? (y/n): ").strip().lower()
+    if apply_now == "y":
+        try:
+            subprocess.run(["regedit.exe", "/s", REG_FILE_NAME], check=True)
+            print("✅ Context menu added successfully! Right-click any .gdoc, .gsheet, or .gslides file to use it.")
+        except Exception as e:
+            print(f"⚠️  Failed to apply registry changes: {e}")
+    else:
+        print("ℹ️  You can manually apply the context menu by double-clicking the generated .reg file.")
+
+    # Provide removal instructions
+    print("\nTo remove the context menu later, run:")
+    print(f"  regedit.exe /s \"{os.path.abspath(REMOVE_REG_FILE_NAME)}\"")
+
+if __name__ == "__main__":
+    main()
