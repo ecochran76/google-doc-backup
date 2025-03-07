@@ -1,3 +1,8 @@
+Below is an updated README.md that includes a section with instructions on how to obtain your `client_secrets.json` file:
+
+---
+
+```markdown
 # google_doc_backup
 
 **google_doc_backup** is a command-line tool that backs up your Google Docs, Sheets, and Slides to Microsoft Office formats (DOCX, XLSX, and PPTX). It uses PyDrive to authenticate with Google Drive, supports global searches based on date and title filters, and organizes files in your backup directory by their Google Drive folder hierarchy. It also includes optional version control features such as timestamping, backup pruning, and a no‑clobber mode to prevent re-downloading of existing files.
@@ -19,6 +24,9 @@
 - **Global Search:**  
   Perform searches across your entire Drive based on modification dates (`--newer-than` / `--older-than`) and title (`--title`).
 
+- **Long Path Support (Windows):**  
+  Handles file paths longer than 260 characters by automatically prepending the Windows extended-length prefix.
+
 ## Installation
 
 1. **Clone the Repository:**
@@ -39,6 +47,27 @@
    ```bash
    pip install google_doc_backup
    ```
+
+3. **Install Dependencies:**
+
+   Ensure that the required packages are installed (listed in `requirements.txt`):
+
+   ```bash
+   pip install pydrive python-dateutil
+   ```
+
+## Obtaining client_secrets.json
+
+This tool uses the Google Drive API for accessing your files. To authenticate, you need a `client_secrets.json` file:
+
+1. Visit the [Google Developers Console](https://console.developers.google.com/).
+2. Create a new project (or select an existing one).
+3. Enable the **Google Drive API** for your project.
+4. Go to **Credentials** and click on **Create Credentials** > **OAuth client ID**.
+5. Configure the consent screen if prompted.
+6. Choose **Desktop app** as the application type.
+7. Download the generated `client_secrets.json` file.
+8. Place the `client_secrets.json` file in the same directory as the script (or in the directory specified by your package).
 
 ## Usage
 
@@ -72,7 +101,7 @@ google-doc-backup [options] [paths...]
   Filter files older than the specified date.
 
 - `--title <title>`:  
-  Search for files with a specific title.
+  Search for files with a specific title (partial match).
 
 - `--staggered <n>`:  
   Retain up to _n_ timestamped backups in staggered mode.
@@ -83,21 +112,21 @@ google-doc-backup [options] [paths...]
 ### Examples
 
 - **Global Search with Versioning:**  
-  Back up files with the title "Workouts" modified within the last 30 days. Save backups to `D:\SyncThing\Cloud\Google` using staggered backup retention (up to 5 backups):
+  Back up files with titles containing "Workouts" modified within the last 30 days. Save backups to `E:\SyncThing\Cloud\Google` using staggered backup retention (up to 5 backups):
 
   ```bash
-  google-doc-backup --newer-than="-30d" --backup "D:\SyncThing\Cloud\Google" --staggered=5 --title="Workouts"
+  google-doc-backup --newer-than="-30d" --backup "E:\SyncThing\Cloud\Google" --staggered=5 --title "Workouts"
   ```
 
 - **Prevent Overwrites:**  
   Skip downloading if the target file already exists:
 
   ```bash
-  google-doc-backup --no-clobber --backup "/path/to/backup" --title="Report"
+  google-doc-backup --no-clobber --backup "E:\SyncThing\Cloud\Google" --title "Report"
   ```
 
 - **Local Directory Processing:**  
-  Back up all files in a local folder (which should correspond to a folder in "My Drive"):
+  Back up all files in a local folder (which corresponds to a folder in "My Drive"):
 
   ```bash
   google-doc-backup "H:\My Drive\Documents\Reports"
@@ -105,7 +134,7 @@ google-doc-backup [options] [paths...]
 
 ## Authentication
 
-The tool uses PyDrive for authentication. Place your `client_secrets.json` in the same directory as your package, and the tool will handle credential management automatically.
+The tool uses PyDrive for authentication. Place your `client_secrets.json` file in the same directory as the script, and the tool will handle credential management automatically. For first-time use, a browser window will open to authorize access to your Google Drive.
 
 ## Contributing
 

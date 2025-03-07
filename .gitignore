@@ -3,6 +3,7 @@
 *.xlsm
 *.pptx
 credentials.json
+client_secrets.json
 *.log
 *.reg
 
