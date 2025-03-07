@@ -1,8 +1,3 @@
-Below is an updated README.md that includes a section with instructions on how to obtain your `client_secrets.json` file:
-
----
-
-```markdown
 # google_doc_backup
 
 **google_doc_backup** is a command-line tool that backs up your Google Docs, Sheets, and Slides to Microsoft Office formats (DOCX, XLSX, and PPTX). It uses PyDrive to authenticate with Google Drive, supports global searches based on date and title filters, and organizes files in your backup directory by their Google Drive folder hierarchy. It also includes optional version control features such as timestamping, backup pruning, and a no‑clobber mode to prevent re-downloading of existing files.
