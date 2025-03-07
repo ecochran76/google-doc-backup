@@ -1,6 +1,7 @@
 *.xlsx
 *.docx
 *.xlsm
+*.pptx
 credentials.json
 *.log
 *.reg

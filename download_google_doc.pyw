@@ -19,7 +19,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Set up logging
 log_file = os.path.join(SCRIPT_DIR, "download_google_doc.log")
-logging.basicConfig(filename=log_file, level=logging.INFO, 
+logging.basicConfig(filename=log_file, level=logging.INFO,
                     format='%(asctime)s %(levelname)s: %(message)s')
 
 # Global cache to store folder IDs (and folder metadata for shared files)
@@ -58,9 +58,31 @@ except Exception as e:
 
 drive = GoogleDrive(gauth)
 
-def sanitize_filename(filename):
-    """Replace invalid filename characters with underscores."""
-    return re.sub(r'[\\/*?:"<>|]', "_", filename)
+# --- Long path support helper ---
+def add_long_path_prefix(path):
+    """
+    On Windows, prepend the extended-length path prefix if not already present.
+    This allows you to use paths longer than 260 characters.
+    """
+    if os.name == "nt":
+        abs_path = os.path.abspath(path)
+        if abs_path.startswith("\\\\?\\"):
+            return abs_path
+        if abs_path.startswith("\\\\"):
+            # UNC paths
+            return "\\\\?\\UNC\\" + abs_path.lstrip("\\")
+        else:
+            return "\\\\?\\" + abs_path
+    return path
+
+def sanitize_filename(filename, max_length=100):
+    """Replace invalid characters with underscores, strip whitespace,
+    and optionally truncate the filename (excluding extension) to max_length."""
+    sanitized = re.sub(r'[\\/*?:"<>|]', "_", filename).strip()
+    name, ext = os.path.splitext(sanitized)
+    if len(name) > max_length:
+        name = name[:max_length]
+    return name + ext
 
 def get_export_mimetype(file_type):
     """Map Google Workspace file types to their corresponding MS Office MIME types."""
@@ -92,9 +114,7 @@ def get_export_extension(export_mime_type):
 def parse_date_input(date_str):
     """
     Parse a date string into RFC 3339 UTC format.
-    
-    Accepts absolute dates in many common formats as well as negative values.
-    A negative value (e.g. "-3600", "-1h", "-1 day") is treated as a relative time offset from now.
+    Accepts absolute dates or relative times (e.g., "-1d").
     """
     if not date_str.startswith('-'):
         try:
@@ -135,7 +155,7 @@ def parse_date_input(date_str):
 def find_folder_id(drive_path):
     """
     Find the folder ID in Google Drive based on the relative path from root.
-    Uses a global cache to avoid repeated API calls.
+    Uses a global cache.
     """
     global folder_cache
     if not drive_path or drive_path == ".":
@@ -167,7 +187,7 @@ def find_folder_id(drive_path):
     return folder_id
 
 def strip_duplicate_suffix(filename):
-    """Remove the '(number)' suffix added by Windows for duplicates, preserving trailing spaces."""
+    """Remove the '(number)' suffix added by Windows for duplicates."""
     match = re.match(r"^(.*?)\s*\(\d+\)$", filename)
     if match:
         return match.group(1)
@@ -176,7 +196,7 @@ def strip_duplicate_suffix(filename):
 def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, max_depth=float('inf'),
                         newer_than=None, older_than=None):
     """
-    Find Google Docs/Sheets/Slides files recursively.
+    Recursively find Google Docs/Sheets/Slides files.
     Groups files by title and recurses into subfolders.
     """
     mime_types = {
@@ -204,8 +224,8 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
         for i, f in enumerate(files):
             suffix = "" if i == 0 else f" ({i})"
             files_by_title[title][i] = (f['id'], suffix, f['mimeType'], base_path, f)
-            logging.info(f"File '{title}{suffix}', ID: {f['id']}, MIME: {f['mimeType']}, Path: {base_path}, Created: {f.get('createdDate', 'N/A')}")
-            print(f"✅ File '{title}{suffix}', ID: {f['id']}, MIME: {f['mimeType']}, Path: {base_path}, Created: {f.get('createdDate', 'N/A')}")
+            logging.info(f"File '{title}{suffix}', ID: {f['id']}, MIME: {f['mimeType']}, Path: {base_path}")
+            print(f"✅ File '{title}{suffix}', ID: {f['id']}, MIME: {f['mimeType']}, Path: {base_path}")
     if depth < max_depth:
         for folder in folders:
             subfolder_id = folder['id']
@@ -218,17 +238,15 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
             for title, file_entries in subfolder_files.items():
                 files_by_title.setdefault(title, []).extend(file_entries)
     total_files = sum(len(files) for files in files_by_title.values())
-    logging.info(f"Found {total_files} Google Docs/Sheets/Slides files in folder ID '{folder_id}' (depth {depth}).")
-    print(f"✅ Found {total_files} Google Docs/Sheets/Slides files at depth {depth}.")
+    logging.info(f"Found {total_files} files in folder ID '{folder_id}' (depth {depth}).")
+    print(f"✅ Found {total_files} files at depth {depth}.")
     return files_by_title
 
 def get_file_drive_path(file_meta):
     """
-    Given a file's metadata (which should include a 'parents' field),
-    compute a relative folder path representing its location in Drive.
-    If the top-level folder is "My Drive", it is removed; otherwise,
-    "Shared With Me" is prepended.
-    Folder names are sanitized for OS compatibility.
+    Given a file's metadata, compute a relative folder path representing its location in Drive.
+    If the top-level folder is "My Drive", it is removed; otherwise, "Shared With Me" is prepended.
+    Folder names are sanitized.
     """
     parents = file_meta.get("parents", [])
     if not parents:
@@ -262,22 +280,17 @@ def get_file_drive_path(file_meta):
         return ""
     return os.path.join(*reversed_path)
 
-def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp, 
+def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
                                       output_directory, dry_run=False, file_meta=None,
                                       prune_newest=None, prune_staggered=None, no_clobber=False):
     """
     Download a Google file as an MS Office document, preserving the subfolder structure.
     
-    Version control behavior:
-      - If the plain target file (BaseName.ext) already exists and --no-clobber is set,
-        the download is skipped.
-      - Otherwise, if --timestamp is not specified and the plain target exists, it is renamed
-        into a backup file (appending a timestamp from its OS modified time).
-      - Then, the new file is downloaded:
-           • If --timestamp is specified, the new file's name includes the current timestamp.
-           • Otherwise, it is downloaded as the plain file name (which overwrites by default).
-      - If --staggered or --newest are specified, existing backups (matching BaseName_*.ext)
-        are pruned accordingly.
+    Behavior:
+      - If --no-clobber is set and the plain target exists, skip downloading.
+      - Otherwise, if --timestamp is not specified and the plain target exists, rename it into a backup.
+      - Then download the new file. If --timestamp is specified, its name includes the current timestamp.
+      - If --staggered or --newest are specified, existing backups are pruned.
     """
     meta = file_meta if file_meta else drive.CreateFile({'id': file_id}).FetchMetadata()
     logging.info(f"Retrieved file: {meta['title']} (ID: {file_id}, MIME: {meta['mimeType']})")
@@ -287,18 +300,21 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
     export_mimetype = get_export_mimetype(meta['mimeType'])
     if export_mimetype is None:
         logging.error(f"Unsupported MIME type: {meta['mimeType']}")
-        print("⚠️  Unsupported Google Workspace file type.")
+        print("⚠️  Unsupported file type.")
         return
 
     orig_ext = get_original_extension(mime_type)  # e.g. "gsheet"
     file_extension = get_export_extension(export_mimetype)  # e.g. "xlsx"
     full_output_directory = os.path.join(output_directory, subfolder_path)
-    if not dry_run:
-        os.makedirs(full_output_directory, exist_ok=True)
-    # Construct base_name (without any timestamp)
+    try:
+        if not dry_run:
+            os.makedirs(add_long_path_prefix(full_output_directory), exist_ok=True)
+    except Exception as e:
+        logging.error(f"Failed to create directory {full_output_directory}: {e}")
+        print(f"⚠️  Failed to create directory {full_output_directory}: {e}")
+        return
     base_name = f"{sanitize_filename(meta['title'])}{suffix}{'.' + orig_ext}"
     
-    # Determine target file names:
     plain_target = os.path.join(full_output_directory, f"{base_name}.{file_extension}")
     if add_timestamp:
         current_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -307,34 +323,39 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
         new_file_name = f"{base_name}.{file_extension}"
     new_target = os.path.join(full_output_directory, new_file_name)
     
-    # If --no-clobber is specified and the plain target exists, skip downloading.
-    if no_clobber and os.path.exists(plain_target):
-        logging.info(f"Skipping download because {plain_target} exists (--no-clobber enabled)")
+    if no_clobber and os.path.exists(add_long_path_prefix(plain_target)):
+        logging.info(f"Skipping download; {plain_target} exists (--no-clobber enabled)")
         print(f"⏩ Skipping download: {plain_target} exists")
         return
     
-    # If not using --timestamp and plain_target exists, rename it to a backup using its OS modification time.
-    if not add_timestamp and os.path.exists(plain_target):
-        mod_time = os.path.getmtime(plain_target)
-        mod_dt = datetime.fromtimestamp(mod_time)
-        mod_timestamp = mod_dt.strftime("%Y-%m-%d_%H-%M-%S")
-        backup_name = f"{base_name}_{mod_timestamp}.{file_extension}"
-        backup_path = os.path.join(full_output_directory, backup_name)
-        if not dry_run:
-            os.rename(plain_target, backup_path)
-        logging.info(f"Renamed existing file {plain_target} to backup {backup_path}")
-        print(f"🗑 Renamed existing file to backup: {backup_path}")
+    if not add_timestamp and os.path.exists(add_long_path_prefix(plain_target)):
+        try:
+            mod_time = os.path.getmtime(add_long_path_prefix(plain_target))
+            mod_dt = datetime.fromtimestamp(mod_time)
+            mod_timestamp = mod_dt.strftime("%Y-%m-%d_%H-%M-%S")
+            backup_name = f"{base_name}_{mod_timestamp}.{file_extension}"
+            backup_path = os.path.join(full_output_directory, backup_name)
+            if not dry_run:
+                os.rename(add_long_path_prefix(plain_target), add_long_path_prefix(backup_path))
+            logging.info(f"Renamed {plain_target} to backup {backup_path}")
+            print(f"🗑 Renamed existing file to backup: {backup_path}")
+        except Exception as e:
+            logging.error(f"Error renaming file {plain_target} to backup: {e}")
+            print(f"⚠️ Error renaming file {plain_target} to backup: {e}")
     
-    # Download the new file.
     logging.info(f"{'[Dry Run] Would download' if dry_run else 'Downloading'} to: {new_target}")
     print(f"{'📜 [Dry Run] Would save' if dry_run else '⬇️  Saving'} as: {new_target}")
-    if not dry_run:
-        file_to_download = drive.CreateFile({'id': file_id})
-        file_to_download.GetContentFile(new_target, mimetype=export_mimetype)
-        logging.info(f"Download successful: {new_target}")
-        print(f"✅ File downloaded successfully: {new_target}")
+    try:
+        if not dry_run:
+            file_to_download = drive.CreateFile({'id': file_id})
+            file_to_download.GetContentFile(add_long_path_prefix(new_target), mimetype=export_mimetype)
+            logging.info(f"Download successful: {new_target}")
+            print(f"✅ File downloaded successfully: {new_target}")
+    except Exception as e:
+        logging.error(f"Error downloading file to {new_target}: {e}")
+        print(f"⚠️ Error downloading file to {new_target}: {e}")
+        return
     
-    # --- Backup Pruning: only if versioning options are specified ---
     if prune_newest is not None or prune_staggered is not None:
         pattern = os.path.join(full_output_directory, f"{base_name}_*.{file_extension}")
         existing_backups = glob.glob(pattern)
@@ -353,10 +374,14 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
             backups_with_ts.sort(key=lambda x: x[1], reverse=True)
             if len(backups_with_ts) > prune_newest:
                 for f, ts in backups_with_ts[prune_newest:]:
-                    if not dry_run:
-                        os.remove(f)
-                    logging.info(f"Pruned old backup (newest mode): {f}")
-                    print(f"🗑 Pruned old backup (newest): {f}")
+                    try:
+                        if not dry_run:
+                            os.remove(add_long_path_prefix(f))
+                        logging.info(f"Pruned backup (newest mode): {f}")
+                        print(f"🗑 Pruned backup (newest): {f}")
+                    except Exception as e:
+                        logging.error(f"Error pruning backup {f}: {e}")
+                        print(f"⚠️ Error pruning backup {f}: {e}")
         elif prune_staggered is not None:
             backups_with_ts.sort(key=lambda x: x[1])
             m_val = len(backups_with_ts)
@@ -379,16 +404,19 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
                 files_to_keep = {backups_with_ts[i][0] for i in keep_indices}
                 for f, ts in backups_with_ts:
                     if f not in files_to_keep:
-                        if not dry_run:
-                            os.remove(f)
-                        logging.info(f"Pruned old backup (staggered mode): {f}")
-                        print(f"🗑 Pruned old backup (staggered): {f}")
+                        try:
+                            if not dry_run:
+                                os.remove(add_long_path_prefix(f))
+                            logging.info(f"Pruned backup (staggered mode): {f}")
+                            print(f"🗑 Pruned backup (staggered): {f}")
+                        except Exception as e:
+                            logging.error(f"Error pruning backup {f}: {e}")
+                            print(f"⚠️ Error pruning backup {f}: {e}")
 
 def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than, title_filter, prune_newest, prune_staggered, no_clobber):
     """
-    Perform a global search over the entire Drive using date filters and an optional title filter.
-    For each file, the folder hierarchy is computed so that the file is downloaded into the appropriate
-    subfolder under the backup path.
+    Perform a global search on Drive using the given filters.
+    Each file is downloaded into a subfolder (computed from its Drive path) under the backup directory.
     """
     mime_types = (
         "mimeType = 'application/vnd.google-apps.document' or "
@@ -397,7 +425,7 @@ def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_
     )
     query = f"trashed=false and ({mime_types})"
     if title_filter:
-        query += f" and title='{title_filter}'"
+        query += f" and title contains '{title_filter}'"
     if newer_than:
         query += f" and modifiedDate > '{newer_than}'"
     if older_than:
@@ -405,8 +433,13 @@ def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_
     
     file_list = drive.ListFile({'q': query}).GetList()
     output_directory = os.path.abspath(backup_path) if backup_path else os.getcwd()
-    if not dry_run:
-        os.makedirs(output_directory, exist_ok=True)
+    try:
+        if not dry_run:
+            os.makedirs(add_long_path_prefix(output_directory), exist_ok=True)
+    except Exception as e:
+        logging.error(f"Failed to create directory {output_directory}: {e}")
+        print(f"⚠️ Failed to create directory {output_directory}: {e}")
+        return
     if backup_path:
         logging.info(f"Redirecting download to: {output_directory}")
         print(f"📁 Redirecting download to: {output_directory}")
@@ -428,7 +461,7 @@ def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_
         )
 
 def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than, prune_newest, prune_staggered, no_clobber):
-    """Process a single input path (file or directory)."""
+    """Process a local input path (file or directory)."""
     input_path = os.path.abspath(input_path)
     mime_type_map = {
         '.gdoc': 'application/vnd.google-apps.document',
@@ -443,17 +476,17 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             folder_id = find_folder_id(drive_path)
             files_by_title = find_files_in_drive(drive, folder_id, max_depth=max_depth,
                                                  newer_than=newer_than, older_than=older_than)
-            output_directory = input_path if not backup_path else os.path.abspath(backup_path)
-            if output_directory:
+            output_directory = os.path.abspath(backup_path) if backup_path else input_path
+            try:
                 if not dry_run:
-                    os.makedirs(output_directory, exist_ok=True)
-                if backup_path:
-                    logging.info(f"Redirecting download to: {output_directory}")
-                    print(f"📁 Redirecting download to: {output_directory}")
-            else:
-                logging.warning("Backup path does not match; using default location.")
-                print("⚠️  Backup path does not match any part of the directory. Using default location.")
-                output_directory = input_path
+                    os.makedirs(add_long_path_prefix(output_directory), exist_ok=True)
+            except Exception as e:
+                logging.error(f"Failed to create directory {output_directory}: {e}")
+                print(f"⚠️ Failed to create directory {output_directory}: {e}")
+                return
+            if backup_path:
+                logging.info(f"Redirecting download to: {output_directory}")
+                print(f"📁 Redirecting download to: {output_directory}")
             for title, file_entries in files_by_title.items():
                 for file_id, suffix, mime_type, subfolder_path, file_meta in file_entries:
                     download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
@@ -462,7 +495,7 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
         else:
             if not os.path.exists(input_path):
                 logging.error(f"File does not exist: {input_path}")
-                print(f"⚠️  Error: File does not exist: {input_path}")
+                print(f"⚠️ Error: {input_path} does not exist")
                 return
             logging.info(f"Processing file: {input_path}")
             print(f"Processing: {input_path}")
@@ -470,23 +503,26 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             filename, file_extension = os.path.splitext(full_filename)
             if file_extension not in mime_type_map:
                 logging.error(f"Unsupported file type: {file_extension}")
-                print(f"⚠️  Unsupported file type: {file_extension}")
+                print(f"⚠️ Unsupported file type: {file_extension}")
                 return
             drive_path = os.path.relpath(folder_path, "H:\\My Drive")
             folder_id = find_folder_id(drive_path)
             files_by_title = find_files_in_drive(drive, folder_id, filename=filename,
                                                  max_depth=max_depth, newer_than=newer_than, older_than=older_than)
-            output_directory = folder_path if not backup_path else os.path.abspath(backup_path)
-            if output_directory:
+            output_directory = os.path.abspath(backup_path) if backup_path else folder_path
+            try:
                 if not dry_run:
-                    os.makedirs(output_directory, exist_ok=True)
-                if backup_path:
-                    logging.info(f"Redirecting download to: {output_directory}")
-                    print(f"📁 Redirecting download to: {output_directory}")
+                    os.makedirs(add_long_path_prefix(output_directory), exist_ok=True)
+            except Exception as e:
+                logging.error(f"Failed to create directory {output_directory}: {e}")
+                print(f"⚠️ Failed to create directory {output_directory}: {e}")
+                return
+            if backup_path:
+                logging.info(f"Redirecting download to: {output_directory}")
+                print(f"📁 Redirecting download to: {output_directory}")
             else:
-                logging.warning("Backup path does not match; using default location.")
-                print("⚠️  Backup path does not match any part of the file's directory. Using default location.")
-                output_directory = folder_path
+                logging.warning("Backup path not matched; using default location.")
+                print("⚠️ Backup path not matched; using default location.")
             base_filename = strip_duplicate_suffix(filename)
             if base_filename in files_by_title:
                 for file_id, suffix, mime_type, subfolder_path, file_meta in files_by_title[base_filename]:
@@ -494,26 +530,26 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
                                                       output_directory, dry_run, file_meta,
                                                       prune_newest, prune_staggered, no_clobber)
             else:
-                logging.error(f"File '{base_filename}' not found in Google Drive.")
-                print(f"⚠️  File '{base_filename}' not found in Google Drive.")
+                logging.error(f"File '{base_filename}' not found in Drive.")
+                print(f"⚠️ File '{base_filename}' not found in Drive.")
     except Exception as e:
         logging.exception(f"Processing failed for {input_path}")
-        print(f"⚠️  Processing failed for {input_path}: {e}")
+        print(f"⚠️ Processing failed for {input_path}: {e}")
 
 def parse_arguments():
-    """Parse command line arguments using argparse."""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Download Google Docs/Sheets/Slides as Office files.")
-    parser.add_argument("paths", nargs="*", help="Local input file or directory paths (wildcards supported). Leave empty for a global Drive search.")
+    parser.add_argument("paths", nargs="*", help="Local file/directory paths (wildcards supported). Leave empty for global Drive search.")
     parser.add_argument("--timestamp", action="store_true", help="Append timestamp to new file name.")
     parser.add_argument("--backup", type=str, help="Redirect downloads to backup path.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate download without writing files.")
-    parser.add_argument("--max-depth", type=int, default=float('inf'), help="Maximum recursion depth for folder search.")
-    parser.add_argument("--newer-than", type=str, help="Filter files newer than given date. Accepts absolute dates or relative times (e.g. '-1d').")
-    parser.add_argument("--older-than", type=str, help="Filter files older than given date. Accepts absolute dates or relative times.")
-    parser.add_argument("--title", type=str, help="Search for files with a specific title.")
+    parser.add_argument("--max-depth", type=int, default=float('inf'), help="Max recursion depth for folder search.")
+    parser.add_argument("--newer-than", type=str, help="Filter files newer than a date (absolute or relative, e.g. '-1d').")
+    parser.add_argument("--older-than", type=str, help="Filter files older than a date (absolute or relative).")
+    parser.add_argument("--title", type=str, help="Search for files with a specific title (partial match).")
     parser.add_argument("--staggered", type=int, help="Retain up to <n> timestamped backups in staggered mode.")
     parser.add_argument("--newest", type=int, help="Retain up to <n> most recent timestamped backups.")
-    parser.add_argument("--no-clobber", action="store_true", help="Do not re-download if the target file already exists.")
+    parser.add_argument("--no-clobber", action="store_true", help="Do not re-download if the target exists.")
     return parser.parse_args()
 
 def main():
@@ -529,7 +565,8 @@ def main():
     if not args.paths:
         print("No input paths provided. Performing a global search on your Drive.")
         process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
-                              args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
+                              args.newer_than, args.older_than, args.title,
+                              prune_newest, prune_staggered, args.no_clobber)
     else:
         input_paths = []
         for path in args.paths:
