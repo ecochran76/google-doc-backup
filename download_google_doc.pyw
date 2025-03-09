@@ -555,8 +555,19 @@ def parse_arguments():
 def main():
     print("🚀 Script started!")
     args = parse_arguments()
+    # Process the --newer-than argument:
     if args.newer_than:
-        args.newer_than = parse_date_input(args.newer_than)
+        if args.newer_than.lower() == "last run":
+            if os.path.exists(log_file):
+                mod_time = os.path.getmtime(log_file)
+                dt = datetime.fromtimestamp(mod_time)
+                args.newer_than = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                print(f"⏱ Using log file modified time as --newer-than: {args.newer_than}")
+            else:
+                print("⚠️ Log file not found; ignoring 'last run'")
+                args.newer_than = None
+        else:
+            args.newer_than = parse_date_input(args.newer_than)
     if args.older_than:
         args.older_than = parse_date_input(args.older_than)
     prune_newest = args.newest if args.newest is not None else None
@@ -565,8 +576,7 @@ def main():
     if not args.paths:
         print("No input paths provided. Performing a global search on your Drive.")
         process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
-                              args.newer_than, args.older_than, args.title,
-                              prune_newest, prune_staggered, args.no_clobber)
+                              args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
     else:
         input_paths = []
         for path in args.paths:
@@ -579,6 +589,7 @@ def main():
             process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
                          args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
     print("✅ Script completed!")
+
 
 if __name__ == "__main__":
     main()
