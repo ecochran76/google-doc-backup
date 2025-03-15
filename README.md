@@ -27,6 +27,13 @@
 - **Long Path Support (Windows):**  
   Handles file paths longer than 260 characters by automatically prepending the Windows extended-length prefix.
 
+- **Standalone Apps Script Backup:**  
+  - Back up your standalone Google Apps Script projects using CLASP.
+  - A dedicated `AppScript` folder is created in your backup directory, with each script project placed in its own subfolder.
+  - If a project’s subfolder is new or missing the CLASP configuration file (`.clasp.json`), the tool performs an initial clone from that subfolder.
+  - If the subfolder already exists and contains a `.clasp.json` file, the tool executes a pull to update the project.
+  - Use the `--no-scripts` flag to suppress standalone script backups.
+
 ## Installation
 
 1. **Clone the Repository:**
@@ -109,6 +116,9 @@ google-doc-backup [options] [paths...]
 - `--newest <n>`:  
   Retain up to _n_ most recent timestamped backups.
 
+- `--no-scripts`:  
+  Do not back up standalone Apps Script projects.
+
 ### Examples
 
 - **Global Search with Versioning:**  
@@ -130,6 +140,13 @@ google-doc-backup [options] [paths...]
 
   ```bash
   google-doc-backup "H:\My Drive\Documents\Reports"
+  ```
+
+- **Standalone Apps Script Backup:**  
+  Back up your standalone Apps Script projects into the `AppScript` subfolder of your backup directory. To disable script backups, use the `--no-scripts` flag:
+
+  ```bash
+  google-doc-backup --backup "E:\SyncThing\Cloud\Google"
   ```
 
 ## Authentication

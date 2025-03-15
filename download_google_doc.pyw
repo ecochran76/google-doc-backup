@@ -8,6 +8,8 @@ import glob
 import math
 import logging
 import argparse
+import subprocess
+import shutil
 from datetime import datetime, timedelta
 
 try:
@@ -617,6 +619,83 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
         logging.exception("Processing failed for %s", input_path)
         print(f"⚠️ Processing failed for {input_path}: {e}")
 
+def get_clasp_command():
+    if os.name == 'nt':
+        # Try to locate clasp.cmd first.
+        cmd_path = shutil.which("clasp.cmd")
+        if cmd_path:
+            return ["clasp.cmd"]
+        # If not found, try clasp.ps1.
+        ps1_path = shutil.which("clasp.ps1")
+        if ps1_path:
+            # Use PowerShell to execute the script.
+            return ["powershell", "-ExecutionPolicy", "Bypass", "-File", ps1_path]
+        return None
+    else:
+        cmd_path = shutil.which("clasp")
+        return [cmd_path] if cmd_path else None
+
+def backup_standalone_scripts(backup_directory, dry_run):
+    clasp_cmd_list = get_clasp_command()
+    if clasp_cmd_list is None:
+        print("Error: CLASP command not found.")
+        if os.name == "nt":
+            print("On Windows, please install Node.js and then run: npm install -g @google/clasp")
+        else:
+            print("On Unix-like systems, please install Node.js (which includes npm) and then run: npm install -g @google/clasp")
+        sys.exit(1)
+
+    # Create a common backup directory for all script projects.
+    script_backup_dir = os.path.join(backup_directory, "AppScript")
+    try:
+        if not dry_run:
+            os.makedirs(script_backup_dir, exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ Failed to create script backup directory {script_backup_dir}: {e}")
+        return
+
+    query = "mimeType='application/vnd.google-apps.script' and trashed=false"
+    try:
+        script_files = drive.ListFile({'q': query}).GetList()
+    except Exception as e:
+        print(f"⚠️ Error querying standalone script projects: {e}")
+        return
+
+    if not script_files:
+        print("No standalone script projects found.")
+        return
+
+    print(f"📄 Found {len(script_files)} standalone script project(s).")
+    for script_file in script_files:
+        project_id = script_file['id']
+        project_title = sanitize_filename(script_file['title'])
+        # Create a folder for each project.
+        project_backup_dir = os.path.join(script_backup_dir, project_title)
+        print(f"📁 Backing up standalone script project: {project_title} (ID: {project_id})")
+
+        if dry_run:
+            print(f"⏱ [Dry Run] Would run: { ' '.join(clasp_cmd_list + ['clone', project_id]) } or pull if folder exists")
+            continue
+
+        # Create the subfolder if it doesn't exist.
+        os.makedirs(project_backup_dir, exist_ok=True)
+        clasp_config_path = os.path.join(project_backup_dir, ".clasp.json")
+        if os.path.exists(clasp_config_path):
+            # Folder exists and contains a CLASP configuration file → perform pull.
+            print(f"🔄 Folder exists. Running clasp pull in {project_backup_dir}")
+            try:
+                subprocess.run(clasp_cmd_list + ["pull"], cwd=project_backup_dir, check=True)
+                print(f"✅ Successfully updated {project_title} in {project_backup_dir}")
+            except subprocess.CalledProcessError as e:
+                print(f"⚠️ CLASP pull failed for project {project_title}: {e}")
+        else:
+            # Folder does not have a CLASP configuration file → perform clone.
+            print(f"⬇️  Folder missing configuration. Running clasp clone in {project_backup_dir}")
+            try:
+                subprocess.run(clasp_cmd_list + ["clone", project_id], cwd=project_backup_dir, check=True)
+                print(f"✅ Successfully cloned {project_title} into {project_backup_dir}")
+            except subprocess.CalledProcessError as e:
+                print(f"⚠️ CLASP clone failed for project {project_title}: {e}")
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -632,6 +711,7 @@ def parse_arguments():
     parser.add_argument("--staggered", type=int, help="Retain up to <n> timestamped backups in staggered mode.")
     parser.add_argument("--newest", type=int, help="Retain up to <n> most recent timestamped backups.")
     parser.add_argument("--no-clobber", action="store_true", help="Do not re-download if the target exists.")
+    parser.add_argument("--no-scripts", action="store_true", help="Do not back up standalone Apps Script projects.")
     return parser.parse_args()
 
 
@@ -671,6 +751,13 @@ def main():
         for input_path in input_paths:
             process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
                          args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
+    # Now, if not suppressed, back up standalone Apps Script projects.
+    if not args.no_scripts:
+        backup_dir = os.path.abspath(args.backup) if args.backup else os.getcwd()
+        print("🔄 Attempting to back up standalone Apps Script projects...")
+        backup_standalone_scripts(backup_dir, args.dry_run)
+    else:
+        print("ℹ️ Standalone script backup suppressed (--no-scripts provided).")
     print("✅ Script completed!")
 
 
