@@ -36,6 +36,10 @@ folder_cache = {}
 CLIENT_SECRETS_PATH = os.path.join(SCRIPT_DIR, "client_secrets.json")
 CREDENTIALS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
 def load_and_authenticate():
     """
     Load credentials from file and ensure they are valid.
@@ -44,7 +48,11 @@ def load_and_authenticate():
     Returns a GoogleAuth instance with valid credentials.
     """
     gauth = GoogleAuth()
+<<<<<<< HEAD
     gauth.settings['client_config_file'] = CLIENT_SECRETS_PATH  # Specify the client secrets file path
+=======
+
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
     # Attempt to load stored credentials.
     if os.path.exists(CREDENTIALS_PATH):
         try:
@@ -53,11 +61,19 @@ def load_and_authenticate():
             logging.error("Error loading credentials: %s", e, exc_info=True)
             os.remove(CREDENTIALS_PATH)
             gauth.credentials = None
+<<<<<<< HEAD
+=======
+
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
     # If credentials exist but the token is expired, remove them.
     if gauth.credentials and gauth.access_token_expired:
         logging.info("Credentials expired. Removing stale credentials.")
         os.remove(CREDENTIALS_PATH)
         gauth.credentials = None
+<<<<<<< HEAD
+=======
+
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
     # If no valid credentials are found, perform authentication.
     if not gauth.credentials:
         print("No valid credentials found. Authenticating with Google...")
@@ -75,6 +91,10 @@ def load_and_authenticate():
             gauth.SaveCredentialsFile(CREDENTIALS_PATH)
     return gauth
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
 # Authenticate and create the drive instance.
 gauth = load_and_authenticate()
 drive = GoogleDrive(gauth)
@@ -186,7 +206,12 @@ def parse_date_input(date_str):
             print(f"Error parsing relative time: {date_str}")
             sys.exit(1)
 
+<<<<<<< HEAD
 def find_folder_id(drive_path, starting_folder_id='root'):
+=======
+
+def find_folder_id(drive_path):
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
     """
     Find the folder ID in Google Drive based on a relative path.
     
@@ -232,6 +257,7 @@ def find_folder_id(drive_path, starting_folder_id='root'):
     for folder_name in drive_path.split(os.path.sep):
         if not folder_name:
             continue
+<<<<<<< HEAD
 
         # If current folder is not root, check whether it already matches the target.
         if folder_id != 'root':
@@ -337,6 +363,25 @@ def find_folder_id(drive_path, starting_folder_id='root'):
         logging.info("Found folder '%s', ID: %s", file_list[0]['title'], folder_id)
         print(f"✅ Found folder '{file_list[0]['title']}', ID: {folder_id}")
     
+=======
+        logging.info("Looking for folder: %s", folder_name)
+        print(f"📂 Looking for folder: {folder_name}")
+        if folder_name.startswith('.shortcut-targets-by-id'):
+            target_id = folder_name.split('-')[-1]
+            logging.info("Using shortcut target ID: %s", target_id)
+            print(f"🔗 Using shortcut target ID: {target_id}")
+            folder_id = target_id
+            continue
+        query = f"'{folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and title='{folder_name}'"
+        file_list = drive.ListFile({'q': query}).GetList()
+        if not file_list:
+            logging.error("Folder '%s' not found in Google Drive.", folder_name)
+            print(f"⚠️  Folder '{folder_name}' not found in Google Drive.")
+            raise ValueError(f"Folder '{folder_name}' not found in Google Drive.")
+        folder_id = file_list[0]['id']
+        logging.info("Found folder '%s', ID: %s", folder_name, folder_id)
+        print(f"✅ Found folder '{folder_name}', ID: {folder_id}")
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
     folder_cache[drive_path] = folder_id
     return folder_id
 
@@ -347,6 +392,7 @@ def strip_duplicate_suffix(filename):
     if match:
         return match.group(1)
     return filename
+
 
 def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, max_depth=float('inf'),
                         newer_than=None, older_than=None):
@@ -656,6 +702,7 @@ def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_
             no_clobber=no_clobber
         )
 
+
 def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, newer_than, older_than, prune_newest, prune_staggered, no_clobber):
     """Process a local input path (file or directory)."""
     input_path = os.path.abspath(input_path)
@@ -724,8 +771,26 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
                                                       output_directory, dry_run, file_meta,
                                                       prune_newest, prune_staggered, no_clobber)
         else:
+<<<<<<< HEAD
             base_filename = strip_duplicate_suffix(filename)
             files_by_title = find_files_in_drive(drive, folder_id, filename=base_filename,
+=======
+            if not os.path.exists(input_path):
+                logging.error("File does not exist: %s", input_path)
+                print(f"⚠️ Error: {input_path} does not exist")
+                return
+            logging.info("Processing file: %s", input_path)
+            print(f"Processing: {input_path}")
+            folder_path, full_filename = os.path.split(input_path)
+            filename, file_extension = os.path.splitext(full_filename)
+            if file_extension not in mime_type_map:
+                logging.error("Unsupported file type: %s", file_extension)
+                print(f"⚠️ Unsupported file type: {file_extension}")
+                return
+            drive_path = os.path.relpath(folder_path, "H:\\My Drive")
+            folder_id = find_folder_id(drive_path)
+            files_by_title = find_files_in_drive(drive, folder_id, filename=filename,
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
                                                  max_depth=max_depth, newer_than=newer_than, older_than=older_than)
             output_directory = os.path.abspath(backup_path) if backup_path else folder_path
             try:
@@ -888,7 +953,11 @@ def main():
             process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
                          args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
     # Now, if not suppressed, back up standalone Apps Script projects.
+<<<<<<< HEAD
     if not args.no_scripts and backup_mode:
+=======
+    if not args.no_scripts:
+>>>>>>> 894aef5fa39df4fea76a23f1f56fbeddd5e025dd
         backup_dir = os.path.abspath(args.backup) if args.backup else os.getcwd()
         print("🔄 Attempting to back up standalone Apps Script projects...")
         backup_standalone_scripts(backup_dir, args.dry_run)
