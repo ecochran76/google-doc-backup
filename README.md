@@ -1,6 +1,6 @@
 # google_doc_backup
 
-**google_doc_backup** is a command-line tool that backs up your Google Docs, Sheets, and Slides to Microsoft Office formats (DOCX, XLSX, and PPTX). It uses PyDrive to authenticate with Google Drive, supports global searches based on date and title filters, and organizes files in your backup directory by their Google Drive folder hierarchy. It also includes optional version control features such as timestamping, backup pruning, and a no‑clobber mode to prevent re-downloading of existing files.
+**google_doc_backup** is a command-line tool that backs up your Google Docs, Sheets, and Slides to Microsoft Office formats (DOCX, XLSX, and PPTX). It uses PyDrive to authenticate with Google Drive, supports global searches based on date and title filters, and organizes files in your backup directory by their Google Drive folder hierarchy. It also includes optional version control features such as timestamping, backup pruning, and a no‑clobber mode to prevent re‑downloading of existing files.
 
 ## Features
 
@@ -11,16 +11,28 @@
   Preserve your Google Drive folder structure when saving files locally.
 
 - **Version Control Options:**  
-  - Append a timestamp to downloaded files (`--timestamp`).
-  - Automatically rename existing files to backups using their OS modification time.
+  - Append a timestamp to downloaded files (`--timestamp`). The timestamp is taken from the Google Drive file's modified date rather than the current time.
+  - Automatically rename existing files to backups using their Google Drive modified timestamp.
   - Retain a specified number of backups using either a staggered or newest-pruning strategy (`--staggered` or `--newest`).
-  - Optionally prevent re-downloading of files if they already exist (`--no-clobber`).
+  - Optionally prevent re‑downloading of files if they already exist (`--no‑clobber`).
+
+- **Accurate Timestamps and Redundancy Checks:**  
+  - The tool sets the downloaded file’s modification time to match that on Google Drive.
+  - When timestamping is enabled, the appended timestamp reflects the Google Drive modified date.
+  - Files are skipped if a local copy exists with an identical modified time (within a one‑second tolerance).
 
 - **Global Search:**  
   Perform searches across your entire Drive based on modification dates (`--newer-than` / `--older-than`) and title (`--title`).
 
 - **Long Path Support (Windows):**  
   Handles file paths longer than 260 characters by automatically prepending the Windows extended-length prefix.
+
+- **Standalone Apps Script Backup:**  
+  - Back up your standalone Google Apps Script projects using CLASP.
+  - A dedicated `AppScript` folder is created in your backup directory, with each script project placed in its own subfolder.
+  - If a project’s subfolder is new or missing the CLASP configuration file (`.clasp.json`), the tool performs an initial clone from that subfolder.
+  - If the subfolder already exists and contains a `.clasp.json` file, the tool executes a pull to update the project.
+  - Use the `--no-scripts` flag to suppress standalone script backups.
 
 ## Installation
 
@@ -78,13 +90,13 @@ google-doc-backup [options] [paths...]
   Local file or directory paths (wildcards supported). If omitted, a global Drive search is performed.
 
 - `--timestamp`:  
-  Append the current timestamp to the new file name.
+  Append the Google file’s modified timestamp to the new file name.
 
 - `--backup <backup_path>`:  
   Specify a destination directory for backups. Files will be organized into subfolders matching their Drive folder hierarchy.
 
 - `--no-clobber`:  
-  Do not re-download a file if it already exists.
+  Do not re‑download a file if it already exists.
 
 - `--max-depth <n>`:  
   Maximum recursion depth for folder search (default: unlimited).
@@ -104,6 +116,9 @@ google-doc-backup [options] [paths...]
 - `--newest <n>`:  
   Retain up to _n_ most recent timestamped backups.
 
+- `--no-scripts`:  
+  Do not back up standalone Apps Script projects.
+
 ### Examples
 
 - **Global Search with Versioning:**  
@@ -114,7 +129,7 @@ google-doc-backup [options] [paths...]
   ```
 
 - **Prevent Overwrites:**  
-  Skip downloading if the target file already exists:
+  Skip downloading if the target file already exists with the same modified time:
 
   ```bash
   google-doc-backup --no-clobber --backup "E:\SyncThing\Cloud\Google" --title "Report"
@@ -125,6 +140,13 @@ google-doc-backup [options] [paths...]
 
   ```bash
   google-doc-backup "H:\My Drive\Documents\Reports"
+  ```
+
+- **Standalone Apps Script Backup:**  
+  Back up your standalone Apps Script projects into the `AppScript` subfolder of your backup directory. To disable script backups, use the `--no-scripts` flag:
+
+  ```bash
+  google-doc-backup --backup "E:\SyncThing\Cloud\Google"
   ```
 
 ## Authentication
