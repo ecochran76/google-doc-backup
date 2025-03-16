@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import glob
+import json  # <-- Ensure json is imported
 import math
 import logging
 import argparse
@@ -771,6 +772,101 @@ def get_clasp_command():
         cmd_path = shutil.which("clasp")
         return [cmd_path] if cmd_path else None
 
+def update_clasp_config(project_backup_dir):
+    """
+    Ensure that the .clasp.json file in project_backup_dir has the correct 'rootDir'.
+    If the current "rootDir" differs from project_backup_dir, update it.
+    """
+    clasp_config_path = os.path.join(project_backup_dir, ".clasp.json")
+    if os.path.exists(clasp_config_path):
+        try:
+            with open(clasp_config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Failed to read {clasp_config_path}: {e}")
+            return
+        current_root = config.get("rootDir", "")
+        normalized_current = os.path.normcase(os.path.normpath(current_root))
+        normalized_expected = os.path.normcase(os.path.normpath(project_backup_dir))
+        if normalized_current != normalized_expected:
+            print(f"🔄 Updating .clasp.json 'rootDir' from '{current_root}' to '{project_backup_dir}'")
+            config["rootDir"] = project_backup_dir
+            try:
+                with open(clasp_config_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4)
+            except Exception as e:
+                print(f"⚠️ Failed to update {clasp_config_path}: {e}")
+
+def check_clasp_readiness(expected_email=None):
+    """
+    Check that CLASP is authenticated by running "clasp show-authorized-user".
+    If the output indicates the user is not logged in, attempt to run "clasp login"
+    and retry. Returns the email reported by CLASP if successful.
+    """
+    clasp_cmd = get_clasp_command()  # e.g., ["clasp.cmd"] on Windows
+    if clasp_cmd is None:
+        raise RuntimeError("CLASP command not found.")
+    
+    def run_show_authorized():
+        result = subprocess.run(clasp_cmd + ["show-authorized-user"], capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    
+    output = run_show_authorized()
+    if "not logged in" in output.lower():
+        print("⚠️ CLASP indicates not logged in. Attempting to log in...")
+        try:
+            subprocess.run(clasp_cmd + ["login"], check=True)
+            output = run_show_authorized()
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"CLASP login failed: {e}")
+    
+    match = re.search(r'([\w\.-]+@[\w\.-]+\.\w+)', output)
+    if match:
+        clasp_email = match.group(1)
+        print(f"CLASP is logged in as: {clasp_email}")
+        if expected_email and clasp_email.lower() != expected_email.lower():
+            raise ValueError(f"CLASP account mismatch: expected {expected_email}, but got {clasp_email}")
+        return clasp_email
+    else:
+        raise ValueError("Unable to parse CLASP show-authorized-user output.")
+
+def get_expected_email():
+    """
+    Attempt to extract the expected email from the Drive credentials.
+    This depends on the structure of gauth.credentials.id_token.
+    """
+    try:
+        token = gauth.credentials.id_token
+        if token and isinstance(token, dict):
+            return token.get('email')
+    except Exception as e:
+        print(f"⚠️ Unable to get expected email from credentials: {e}")
+    return None
+
+def ensure_git_repo(directory):
+    """Ensure that the given directory is a Git repository. If not, initialize one."""
+    git_dir = os.path.join(directory, ".git")
+    if not os.path.exists(git_dir):
+        print(f"Initializing git repository in {directory}")
+        subprocess.run(["git", "init"], cwd=directory, check=True)
+    else:
+        print(f"Git repository exists in {directory}")
+
+def commit_changes(directory, project_name):
+    """
+    Stage and commit any changes in the given directory. If there are changes,
+    commit them with a timestamp-based message.
+    """
+    subprocess.run(["git", "add", "-A"], cwd=directory, check=True)
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=directory)
+    if diff.returncode != 0:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        commit_message = f"Backup update for project '{project_name}' at {timestamp}"
+        subprocess.run(["git", "commit", "-m", commit_message], cwd=directory, check=True)
+        print(f"Committed changes for project '{project_name}'")
+    else:
+        print(f"No changes to commit for project '{project_name}'")
+
 def backup_standalone_scripts(backup_directory, dry_run):
     clasp_cmd_list = get_clasp_command()
     if clasp_cmd_list is None:
@@ -781,7 +877,15 @@ def backup_standalone_scripts(backup_directory, dry_run):
             print("On Unix-like systems, please install Node.js (which includes npm) and then run: npm install -g @google/clasp")
         sys.exit(1)
 
-    # Create a common backup directory for all script projects.
+    # Check that CLASP is logged in to the correct account.
+    expected_email = get_expected_email()
+    try:
+        check_clasp_readiness(expected_email)
+    except Exception as e:
+        print(f"⚠️ CLASP readiness check failed: {e}")
+        sys.exit(1)
+
+    # Create a common backup directory for all standalone script projects.
     script_backup_dir = os.path.join(backup_directory, "AppScript")
     try:
         if not dry_run:
@@ -805,33 +909,39 @@ def backup_standalone_scripts(backup_directory, dry_run):
     for script_file in script_files:
         project_id = script_file['id']
         project_title = sanitize_filename(script_file['title'])
-        # Create a folder for each project.
         project_backup_dir = os.path.join(script_backup_dir, project_title)
         print(f"📁 Backing up standalone script project: {project_title} (ID: {project_id})")
 
         if dry_run:
-            print(f"⏱ [Dry Run] Would run: { ' '.join(clasp_cmd_list + ['clone', project_id]) } or pull if folder exists")
+            print(f"⏱ [Dry Run] Would run: {' '.join(clasp_cmd_list + ['clone', project_id])} or pull if folder exists")
             continue
 
-        # Create the subfolder if it doesn't exist.
         os.makedirs(project_backup_dir, exist_ok=True)
+        ensure_git_repo(project_backup_dir)
+
+        # If .clasp.json exists, update it to ensure the "rootDir" is correct.
         clasp_config_path = os.path.join(project_backup_dir, ".clasp.json")
         if os.path.exists(clasp_config_path):
-            # Folder exists and contains a CLASP configuration file → perform pull.
+            update_clasp_config(project_backup_dir)
+
+        if os.path.exists(clasp_config_path):
             print(f"🔄 Folder exists. Running clasp pull in {project_backup_dir}")
             try:
                 subprocess.run(clasp_cmd_list + ["pull"], cwd=project_backup_dir, check=True)
                 print(f"✅ Successfully updated {project_title} in {project_backup_dir}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠️ CLASP pull failed for project {project_title}: {e}")
+                continue
         else:
-            # Folder does not have a CLASP configuration file → perform clone.
             print(f"⬇️  Folder missing configuration. Running clasp clone in {project_backup_dir}")
             try:
                 subprocess.run(clasp_cmd_list + ["clone", project_id], cwd=project_backup_dir, check=True)
                 print(f"✅ Successfully cloned {project_title} into {project_backup_dir}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠️ CLASP clone failed for project {project_title}: {e}")
+                continue
+
+        commit_changes(project_backup_dir, project_title)
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -848,6 +958,7 @@ def parse_arguments():
     parser.add_argument("--newest", type=int, help="Retain up to <n> most recent timestamped backups.")
     parser.add_argument("--no-clobber", action="store_true", help="Do not re-download if the target exists.")
     parser.add_argument("--no-scripts", action="store_true", help="Do not back up standalone Apps Script projects.")
+    parser.add_argument("--scripts-only", action="store_true", help="Only back up standalone Apps Script projects.")
     return parser.parse_args()
 
 
@@ -873,29 +984,30 @@ def main():
     prune_staggered = None if prune_newest is not None else args.staggered
 
     backup_mode = False
-    if not args.paths:
-        print("No input paths provided. Performing a global search on your Drive.")
-        backup_mode = True
-        process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
-                              args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
-    else:
-        input_paths = []
-        for path in args.paths:
-            expanded = glob.glob(path.strip('"'))
-            if expanded:
-                input_paths.extend(expanded)
-            else:
-                input_paths.append(path.strip('"'))
-        for input_path in input_paths:
-            process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
-                         args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
+    if not args.scripts_only:
+        if not args.paths:
+            print("No input paths provided. Performing a global search on your Drive.")
+            backup_mode = True
+            process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
+                                args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
+        else:
+            input_paths = []
+            for path in args.paths:
+                expanded = glob.glob(path.strip('"'))
+                if expanded:
+                    input_paths.extend(expanded)
+                else:
+                    input_paths.append(path.strip('"'))
+            for input_path in input_paths:
+                process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
+                            args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
+            
     # Now, if not suppressed, back up standalone Apps Script projects.
-    if not args.no_scripts and backup_mode:
+    if not args.no_scripts and (backup_mode or args.scripts_only):
         backup_dir = os.path.abspath(args.backup) if args.backup else os.getcwd()
         print("🔄 Attempting to back up standalone Apps Script projects...")
         backup_standalone_scripts(backup_dir, args.dry_run)
-    else:
-        print("ℹ️ Standalone script backup suppressed (--no-scripts provided).")
+
     print("✅ Script completed!")
 
 if __name__ == "__main__":
