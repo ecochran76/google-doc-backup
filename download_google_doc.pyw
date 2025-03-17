@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import glob
+import json  # <-- Ensure json is imported
 import math
 import logging
 import argparse
@@ -36,7 +37,6 @@ folder_cache = {}
 CLIENT_SECRETS_PATH = os.path.join(SCRIPT_DIR, "client_secrets.json")
 CREDENTIALS_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
 
-
 def load_and_authenticate():
     """
     Load credentials from file and ensure they are valid.
@@ -45,7 +45,7 @@ def load_and_authenticate():
     Returns a GoogleAuth instance with valid credentials.
     """
     gauth = GoogleAuth()
-
+    gauth.settings['client_config_file'] = CLIENT_SECRETS_PATH  # Specify the client secrets file path
     # Attempt to load stored credentials.
     if os.path.exists(CREDENTIALS_PATH):
         try:
@@ -54,13 +54,11 @@ def load_and_authenticate():
             logging.error("Error loading credentials: %s", e, exc_info=True)
             os.remove(CREDENTIALS_PATH)
             gauth.credentials = None
-
     # If credentials exist but the token is expired, remove them.
     if gauth.credentials and gauth.access_token_expired:
         logging.info("Credentials expired. Removing stale credentials.")
         os.remove(CREDENTIALS_PATH)
         gauth.credentials = None
-
     # If no valid credentials are found, perform authentication.
     if not gauth.credentials:
         print("No valid credentials found. Authenticating with Google...")
@@ -77,7 +75,6 @@ def load_and_authenticate():
             gauth.LocalWebserverAuth()
             gauth.SaveCredentialsFile(CREDENTIALS_PATH)
     return gauth
-
 
 # Authenticate and create the drive instance.
 gauth = load_and_authenticate()
@@ -190,38 +187,157 @@ def parse_date_input(date_str):
             print(f"Error parsing relative time: {date_str}")
             sys.exit(1)
 
-
-def find_folder_id(drive_path):
+def find_folder_id(drive_path, starting_folder_id='root'):
     """
-    Find the folder ID in Google Drive based on the relative path from root.
-    Uses a global cache.
+    Find the folder ID in Google Drive based on a relative path.
+    
+    If the drive_path comes from a Drive for Desktop mount and starts with
+    ".shortcut-targets-by-id", then the first two segments are interpreted as the
+    drive_id and its local alias. The online folder title (which may contain a colon)
+    is retrieved and used instead of the local alias.
+    
+    The function first tries an exact match. If that fails, it falls back to word-based
+    search. If no match is found for a segment, a warning is logged and that segment is skipped.
     """
     global folder_cache
-    if not drive_path or drive_path == ".":
-        return 'root'
-    if drive_path in folder_cache:
-        return folder_cache[drive_path]
-    folder_id = 'root'
+    # Split the incoming path into segments.
+    segments = drive_path.split(os.path.sep)
+    
+    # If the path comes from a .shortcut-targets-by-id mount,
+    # then the structure is: [".shortcut-targets-by-id", drive_id, local_alias, ...]
+    if segments[0] == ".shortcut-targets-by-id" and len(segments) >= 3:
+        drive_id = segments[1]
+        # Retrieve the online title for the drive_id folder.
+        try:
+            folder = drive.CreateFile({'id': drive_id})
+            folder.FetchMetadata(fields="title")
+            online_title = folder.get('title', '')
+        except Exception as e:
+            logging.warning("Failed to fetch online title for drive ID %s: %s", drive_id, e)
+            online_title = segments[2]  # Fallback to the local alias.
+        # Replace the local alias with the online title.
+        segments = segments[2:]
+        if segments:
+            segments[0] = online_title
+        # Set the starting folder to be the drive_id folder.
+        folder_id = drive_id
+        drive_path = os.path.sep.join(segments)
+    else:
+        folder_id = starting_folder_id
+
+    # Utility for normalization: replace colon with space, collapse whitespace, and lowercase.
+    def normalize(title):
+        return re.sub(r'\s+', ' ', title.replace(':', ' ')).strip().lower()
+
+    # Process each segment in the (possibly modified) drive_path.
     for folder_name in drive_path.split(os.path.sep):
         if not folder_name:
             continue
-        logging.info("Looking for folder: %s", folder_name)
-        print(f"📂 Looking for folder: {folder_name}")
-        if folder_name.startswith('.shortcut-targets-by-id'):
-            target_id = folder_name.split('-')[-1]
-            logging.info("Using shortcut target ID: %s", target_id)
-            print(f"🔗 Using shortcut target ID: {target_id}")
-            folder_id = target_id
-            continue
-        query = f"'{folder_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and title='{folder_name}'"
-        file_list = drive.ListFile({'q': query}).GetList()
+
+        # If current folder is not root, check whether it already matches the target.
+        if folder_id != 'root':
+            try:
+                current_folder = drive.CreateFile({'id': folder_id})
+                current_folder.FetchMetadata(fields="title")
+                current_title = current_folder.get('title', '')
+            except Exception as e:
+                logging.warning("Unable to fetch metadata for folder ID %s: %s", folder_id, e)
+                current_title = ''
+            if normalize(current_title) == normalize(folder_name):
+                logging.info("Current folder '%s' already matches '%s'; skipping search", current_title, folder_name)
+                print(f"✅ Current folder '{current_title}' already matches '{folder_name}'; skipping search")
+                continue
+
+        logging.info("Looking for folder: %s under %s", folder_name, folder_id)
+        print(f"📂 Looking for folder: {folder_name} under {folder_id}")
+
+        # Step 1: Try an exact match.
+        query = (f"'{folder_id}' in parents and trashed=false and "
+                 f"mimeType='application/vnd.google-apps.folder' and title='{folder_name}'")
+        try:
+            file_list = drive.ListFile({'q': query}).GetList()
+        except Exception as e:
+            logging.error("Exact match query failed: %s", e)
+            print(f"⚠️ Exact match query failed: {e}")
+            file_list = []
+
+        # Step 1b: If no result and folder_name doesn't contain ":" but has multiple spaces,
+        # try restoring the colon.
+        if not file_list and (':' not in folder_name) and re.search(r'\s{2,}', folder_name):
+            alt_name = re.sub(r'\s{2,}', ': ', folder_name)
+            logging.info("Exact match with alternative name '%s'", alt_name)
+            print(f"🔍 Trying alternative name: '{alt_name}'")
+            query = (f"'{folder_id}' in parents and trashed=false and "
+                     f"mimeType='application/vnd.google-apps.folder' and title='{alt_name}'")
+            try:
+                file_list = drive.ListFile({'q': query}).GetList()
+            except Exception as e:
+                logging.error("Exact match alternative query failed: %s", e)
+                print(f"⚠️ Exact match alternative query failed: {e}")
+                file_list = []
+
+        # Step 2: If still no match and folder_name contains special characters, try word-based search.
+        if not file_list and any(char in folder_name for char in ' :;,_-'):
+            logging.info("Exact match failed for '%s', attempting word-based search", folder_name)
+            print(f"🔍 Exact match failed for '{folder_name}', attempting word-based search")
+            
+            words = [word.strip() for word in re.split(r'[\s:;,_-]+', folder_name) if word.strip()]
+            if not words:
+                logging.error("No valid words in folder name: %s", folder_name)
+                print(f"⚠️ No valid words in folder name: {folder_name}")
+                continue
+            
+            search_terms = ' '.join(words)
+            query = (f"'{folder_id}' in parents and trashed=false and "
+                     f"mimeType='application/vnd.google-apps.folder' and title contains '{search_terms}'")
+            logging.info("Word-based query: %s", query)
+            print(f"🔍 Word-based query: {query}")
+            try:
+                file_list = drive.ListFile({'q': query}).GetList()
+                target_length = sum(len(word) for word in words)
+                matches = []
+                pattern = ".*".join(re.escape(word) for word in words)
+                for folder in file_list:
+                    folder_title = folder['title']
+                    folder_words = [w for w in re.split(r'[\s:;,_-]+', folder_title) if w]
+                    folder_length = sum(len(w) for w in folder_words)
+                    if folder_length == target_length and re.search(pattern, folder_title, re.IGNORECASE):
+                        matches.append(folder)
+                
+                if matches:
+                    if len(matches) > 1:
+                        logging.warning("Multiple matches for '%s' under %s: %s. Using first match.",
+                                        folder_name, folder_id, [f['title'] for f in matches])
+                        print(f"⚠️ Multiple matches for '{folder_name}' under {folder_id}: {[f['title'] for f in matches]}. Using first match.")
+                    file_list = [matches[0]]
+                else:
+                    file_list = []
+            except Exception as e:
+                logging.error("Word-based search failed: %s", e)
+                print(f"⚠️ Word-based search failed: {e}")
+                file_list = []
+
+        # Step 3: If still no match, list all subfolders for debugging and skip this segment.
         if not file_list:
-            logging.error("Folder '%s' not found in Google Drive.", folder_name)
-            print(f"⚠️  Folder '{folder_name}' not found in Google Drive.")
-            raise ValueError(f"Folder '{folder_name}' not found in Google Drive.")
+            all_folders_query = (f"'{folder_id}' in parents and trashed=false and "
+                                 f"mimeType='application/vnd.google-apps.folder'")
+            try:
+                all_folders = drive.ListFile({'q': all_folders_query}).GetList()
+                available = [f['title'] for f in all_folders]
+                logging.error("No matching folder found for '%s' under %s. Available folders: %s",
+                              folder_name, folder_id, available)
+                print(f"⚠️ No matching folder found for '{folder_name}' under {folder_id}. Available folders: {available}")
+            except Exception as e:
+                logging.error("Failed to list subfolders: %s", e)
+                print(f"⚠️ Failed to list subfolders: {e}")
+            logging.warning("Skipping folder segment '%s'", folder_name)
+            print(f"⚠️ Skipping folder segment '{folder_name}'")
+            continue
+        
         folder_id = file_list[0]['id']
-        logging.info("Found folder '%s', ID: %s", folder_name, folder_id)
-        print(f"✅ Found folder '{folder_name}', ID: {folder_id}")
+        logging.info("Found folder '%s', ID: %s", file_list[0]['title'], folder_id)
+        print(f"✅ Found folder '{file_list[0]['title']}', ID: {folder_id}")
+    
     folder_cache[drive_path] = folder_id
     return folder_id
 
@@ -555,8 +671,43 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
         if os.path.isdir(input_path):
             logging.info("Input is a directory: %s", input_path)
             print(f"📁 Processing directory: {input_path}")
-            drive_path = os.path.relpath(input_path, "H:\\My Drive")
-            folder_id = find_folder_id(drive_path)
+            folder_path = input_path
+        else:
+            if not os.path.exists(input_path):
+                logging.error("File does not exist: %s", input_path)
+                print(f"⚠️ Error: {input_path} does not exist")
+                return
+            logging.info("Processing file: %s", input_path)
+            print(f"Processing: {input_path}")
+            folder_path, full_filename = os.path.split(input_path)
+            filename, file_extension = os.path.splitext(full_filename)
+            if file_extension not in mime_type_map:
+                logging.error("Unsupported file type: %s", file_extension)
+                print(f"⚠️ Unsupported file type: {file_extension}")
+                return
+
+        # Determine starting_folder_id and relative_path
+        if folder_path.startswith("H:\\My Drive"):
+            starting_folder_id = 'root'
+            relative_path = os.path.relpath(folder_path, "H:\\My Drive")
+        elif folder_path.startswith("H:\\.shortcut-targets-by-id"):
+            parts = folder_path.split(os.path.sep)
+            if len(parts) >= 3 and parts[1] == '.shortcut-targets-by-id':
+                target_id = parts[2]
+                subfolders = parts[3:]
+                starting_folder_id = target_id
+                relative_path = os.path.sep.join(subfolders)
+            else:
+                logging.error("Invalid path under .shortcut-targets-by-id: %s", folder_path)
+                print(f"⚠️ Invalid path under .shortcut-targets-by-id: {folder_path}")
+                return
+        else:
+            logging.error("Path not under My Drive or .shortcut-targets-by-id: %s", folder_path)
+            print(f"⚠️ Path not under My Drive or .shortcut-targets-by-id: {folder_path}")
+            return
+
+        folder_id = find_folder_id(relative_path, starting_folder_id)
+        if os.path.isdir(input_path):
             files_by_title = find_files_in_drive(drive, folder_id, max_depth=max_depth,
                                                  newer_than=newer_than, older_than=older_than)
             output_directory = os.path.abspath(backup_path) if backup_path else input_path
@@ -576,21 +727,8 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
                                                       output_directory, dry_run, file_meta,
                                                       prune_newest, prune_staggered, no_clobber)
         else:
-            if not os.path.exists(input_path):
-                logging.error("File does not exist: %s", input_path)
-                print(f"⚠️ Error: {input_path} does not exist")
-                return
-            logging.info("Processing file: %s", input_path)
-            print(f"Processing: {input_path}")
-            folder_path, full_filename = os.path.split(input_path)
-            filename, file_extension = os.path.splitext(full_filename)
-            if file_extension not in mime_type_map:
-                logging.error("Unsupported file type: %s", file_extension)
-                print(f"⚠️ Unsupported file type: {file_extension}")
-                return
-            drive_path = os.path.relpath(folder_path, "H:\\My Drive")
-            folder_id = find_folder_id(drive_path)
-            files_by_title = find_files_in_drive(drive, folder_id, filename=filename,
+            base_filename = strip_duplicate_suffix(filename)
+            files_by_title = find_files_in_drive(drive, folder_id, filename=base_filename,
                                                  max_depth=max_depth, newer_than=newer_than, older_than=older_than)
             output_directory = os.path.abspath(backup_path) if backup_path else folder_path
             try:
@@ -606,7 +744,6 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
             else:
                 logging.warning("Backup path not matched; using default location.")
                 print("⚠️ Backup path not matched; using default location.")
-            base_filename = strip_duplicate_suffix(filename)
             if base_filename in files_by_title:
                 for file_id, suffix, mime_type, subfolder_path, file_meta in files_by_title[base_filename]:
                     download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
@@ -635,6 +772,101 @@ def get_clasp_command():
         cmd_path = shutil.which("clasp")
         return [cmd_path] if cmd_path else None
 
+def update_clasp_config(project_backup_dir):
+    """
+    Ensure that the .clasp.json file in project_backup_dir has the correct 'rootDir'.
+    If the current "rootDir" differs from project_backup_dir, update it.
+    """
+    clasp_config_path = os.path.join(project_backup_dir, ".clasp.json")
+    if os.path.exists(clasp_config_path):
+        try:
+            with open(clasp_config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Failed to read {clasp_config_path}: {e}")
+            return
+        current_root = config.get("rootDir", "")
+        normalized_current = os.path.normcase(os.path.normpath(current_root))
+        normalized_expected = os.path.normcase(os.path.normpath(project_backup_dir))
+        if normalized_current != normalized_expected:
+            print(f"🔄 Updating .clasp.json 'rootDir' from '{current_root}' to '{project_backup_dir}'")
+            config["rootDir"] = project_backup_dir
+            try:
+                with open(clasp_config_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4)
+            except Exception as e:
+                print(f"⚠️ Failed to update {clasp_config_path}: {e}")
+
+def check_clasp_readiness(expected_email=None):
+    """
+    Check that CLASP is authenticated by running "clasp show-authorized-user".
+    If the output indicates the user is not logged in, attempt to run "clasp login"
+    and retry. Returns the email reported by CLASP if successful.
+    """
+    clasp_cmd = get_clasp_command()  # e.g., ["clasp.cmd"] on Windows
+    if clasp_cmd is None:
+        raise RuntimeError("CLASP command not found.")
+    
+    def run_show_authorized():
+        result = subprocess.run(clasp_cmd + ["show-authorized-user"], capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    
+    output = run_show_authorized()
+    if "not logged in" in output.lower():
+        print("⚠️ CLASP indicates not logged in. Attempting to log in...")
+        try:
+            subprocess.run(clasp_cmd + ["login"], check=True)
+            output = run_show_authorized()
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"CLASP login failed: {e}")
+    
+    match = re.search(r'([\w\.-]+@[\w\.-]+\.\w+)', output)
+    if match:
+        clasp_email = match.group(1)
+        print(f"CLASP is logged in as: {clasp_email}")
+        if expected_email and clasp_email.lower() != expected_email.lower():
+            raise ValueError(f"CLASP account mismatch: expected {expected_email}, but got {clasp_email}")
+        return clasp_email
+    else:
+        raise ValueError("Unable to parse CLASP show-authorized-user output.")
+
+def get_expected_email():
+    """
+    Attempt to extract the expected email from the Drive credentials.
+    This depends on the structure of gauth.credentials.id_token.
+    """
+    try:
+        token = gauth.credentials.id_token
+        if token and isinstance(token, dict):
+            return token.get('email')
+    except Exception as e:
+        print(f"⚠️ Unable to get expected email from credentials: {e}")
+    return None
+
+def ensure_git_repo(directory):
+    """Ensure that the given directory is a Git repository. If not, initialize one."""
+    git_dir = os.path.join(directory, ".git")
+    if not os.path.exists(git_dir):
+        print(f"Initializing git repository in {directory}")
+        subprocess.run(["git", "init"], cwd=directory, check=True)
+    else:
+        print(f"Git repository exists in {directory}")
+
+def commit_changes(directory, project_name):
+    """
+    Stage and commit any changes in the given directory. If there are changes,
+    commit them with a timestamp-based message.
+    """
+    subprocess.run(["git", "add", "-A"], cwd=directory, check=True)
+    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=directory)
+    if diff.returncode != 0:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        commit_message = f"Backup update for project '{project_name}' at {timestamp}"
+        subprocess.run(["git", "commit", "-m", commit_message], cwd=directory, check=True)
+        print(f"Committed changes for project '{project_name}'")
+    else:
+        print(f"No changes to commit for project '{project_name}'")
+
 def backup_standalone_scripts(backup_directory, dry_run):
     clasp_cmd_list = get_clasp_command()
     if clasp_cmd_list is None:
@@ -645,7 +877,15 @@ def backup_standalone_scripts(backup_directory, dry_run):
             print("On Unix-like systems, please install Node.js (which includes npm) and then run: npm install -g @google/clasp")
         sys.exit(1)
 
-    # Create a common backup directory for all script projects.
+    # Check that CLASP is logged in to the correct account.
+    expected_email = get_expected_email()
+    try:
+        check_clasp_readiness(expected_email)
+    except Exception as e:
+        print(f"⚠️ CLASP readiness check failed: {e}")
+        sys.exit(1)
+
+    # Create a common backup directory for all standalone script projects.
     script_backup_dir = os.path.join(backup_directory, "AppScript")
     try:
         if not dry_run:
@@ -669,33 +909,39 @@ def backup_standalone_scripts(backup_directory, dry_run):
     for script_file in script_files:
         project_id = script_file['id']
         project_title = sanitize_filename(script_file['title'])
-        # Create a folder for each project.
         project_backup_dir = os.path.join(script_backup_dir, project_title)
         print(f"📁 Backing up standalone script project: {project_title} (ID: {project_id})")
 
         if dry_run:
-            print(f"⏱ [Dry Run] Would run: { ' '.join(clasp_cmd_list + ['clone', project_id]) } or pull if folder exists")
+            print(f"⏱ [Dry Run] Would run: {' '.join(clasp_cmd_list + ['clone', project_id])} or pull if folder exists")
             continue
 
-        # Create the subfolder if it doesn't exist.
         os.makedirs(project_backup_dir, exist_ok=True)
+        ensure_git_repo(project_backup_dir)
+
+        # If .clasp.json exists, update it to ensure the "rootDir" is correct.
         clasp_config_path = os.path.join(project_backup_dir, ".clasp.json")
         if os.path.exists(clasp_config_path):
-            # Folder exists and contains a CLASP configuration file → perform pull.
+            update_clasp_config(project_backup_dir)
+
+        if os.path.exists(clasp_config_path):
             print(f"🔄 Folder exists. Running clasp pull in {project_backup_dir}")
             try:
                 subprocess.run(clasp_cmd_list + ["pull"], cwd=project_backup_dir, check=True)
                 print(f"✅ Successfully updated {project_title} in {project_backup_dir}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠️ CLASP pull failed for project {project_title}: {e}")
+                continue
         else:
-            # Folder does not have a CLASP configuration file → perform clone.
             print(f"⬇️  Folder missing configuration. Running clasp clone in {project_backup_dir}")
             try:
                 subprocess.run(clasp_cmd_list + ["clone", project_id], cwd=project_backup_dir, check=True)
                 print(f"✅ Successfully cloned {project_title} into {project_backup_dir}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠️ CLASP clone failed for project {project_title}: {e}")
+                continue
+
+        commit_changes(project_backup_dir, project_title)
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -712,6 +958,7 @@ def parse_arguments():
     parser.add_argument("--newest", type=int, help="Retain up to <n> most recent timestamped backups.")
     parser.add_argument("--no-clobber", action="store_true", help="Do not re-download if the target exists.")
     parser.add_argument("--no-scripts", action="store_true", help="Do not back up standalone Apps Script projects.")
+    parser.add_argument("--scripts-only", action="store_true", help="Only back up standalone Apps Script projects.")
     return parser.parse_args()
 
 
@@ -736,30 +983,32 @@ def main():
     prune_newest = args.newest if args.newest is not None else None
     prune_staggered = None if prune_newest is not None else args.staggered
 
-    if not args.paths:
-        print("No input paths provided. Performing a global search on your Drive.")
-        process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
-                              args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
-    else:
-        input_paths = []
-        for path in args.paths:
-            expanded = glob.glob(path.strip('"'))
-            if expanded:
-                input_paths.extend(expanded)
-            else:
-                input_paths.append(path.strip('"'))
-        for input_path in input_paths:
-            process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
-                         args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
+    backup_mode = False
+    if not args.scripts_only:
+        if not args.paths:
+            print("No input paths provided. Performing a global search on your Drive.")
+            backup_mode = True
+            process_global_search(args.timestamp, args.backup, args.dry_run, args.max_depth,
+                                args.newer_than, args.older_than, args.title, prune_newest, prune_staggered, args.no_clobber)
+        else:
+            input_paths = []
+            for path in args.paths:
+                expanded = glob.glob(path.strip('"'))
+                if expanded:
+                    input_paths.extend(expanded)
+                else:
+                    input_paths.append(path.strip('"'))
+            for input_path in input_paths:
+                process_path(input_path, args.timestamp, args.backup, args.dry_run, args.max_depth,
+                            args.newer_than, args.older_than, prune_newest, prune_staggered, args.no_clobber)
+            
     # Now, if not suppressed, back up standalone Apps Script projects.
-    if not args.no_scripts:
+    if not args.no_scripts and (backup_mode or args.scripts_only):
         backup_dir = os.path.abspath(args.backup) if args.backup else os.getcwd()
         print("🔄 Attempting to back up standalone Apps Script projects...")
         backup_standalone_scripts(backup_dir, args.dry_run)
-    else:
-        print("ℹ️ Standalone script backup suppressed (--no-scripts provided).")
-    print("✅ Script completed!")
 
+    print("✅ Script completed!")
 
 if __name__ == "__main__":
     main()
