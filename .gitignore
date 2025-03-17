@@ -6,6 +6,6 @@ credentials.json
 client_secrets.json
 *.log
 *.reg
-
+package*.json
 
 
