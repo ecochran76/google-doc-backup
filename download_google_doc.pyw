@@ -22,6 +22,7 @@ except ImportError:
 from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive
 from googleapiclient.discovery import build  # FIX: Import for v3 service to fetch shared drive names
+from googleapiclient.errors import HttpError
 
 # Get the absolute path of the script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +95,101 @@ ALL_DRIVES_PARAMS = {
     'supportsTeamDrives': True,
     'includeTeamDriveItems': True,
 }
+
+SHARED_DRIVE_MARKERS = {
+    'shared drives',
+    'shared drive',
+    'team drives',
+    'team drive',
+}
+
+shared_drive_id_cache = {}
+shared_drive_name_cache = {}
+
+
+def list_drive_files(params):
+    merged = dict(ALL_DRIVES_PARAMS)
+    if params:
+        merged.update(params)
+    return drive.ListFile(merged).GetList()
+
+
+def ensure_shared_drive_cache():
+    global shared_drive_id_cache, shared_drive_name_cache
+    if shared_drive_name_cache:
+        return
+    if drive_v3 is None:
+        return
+    page_token = None
+    while True:
+        try:
+            response = drive_v3.drives().list(pageSize=100, pageToken=page_token).execute()
+        except HttpError as e:
+            logging.warning('Failed to list shared drives: %s', e)
+            break
+        for drive_meta in response.get('drives', []):
+            drive_id = drive_meta.get('id')
+            if not drive_id:
+                continue
+            shared_drive_id_cache[drive_id] = drive_meta
+            name_key = drive_meta.get('name', '').strip().lower()
+            if name_key:
+                shared_drive_name_cache[name_key] = drive_meta
+        page_token = response.get('nextPageToken')
+        if not page_token:
+            break
+
+
+def get_shared_drive_metadata_by_name(name):
+    if not name:
+        return None
+    key = name.strip().lower()
+    if key in shared_drive_name_cache:
+        return shared_drive_name_cache[key]
+    ensure_shared_drive_cache()
+    return shared_drive_name_cache.get(key)
+
+
+def get_shared_drive_name(drive_id):
+    if not drive_id:
+        return None
+    if drive_id in shared_drive_id_cache:
+        return shared_drive_id_cache[drive_id].get('name')
+    if drive_v3 is None:
+        return None
+    try:
+        response = drive_v3.drives().get(driveId=drive_id).execute()
+    except HttpError as e:
+        logging.warning('Failed to fetch shared drive name for %s: %s', drive_id, e)
+        return None
+    if response:
+        shared_drive_id_cache[drive_id] = response
+        name_key = response.get('name', '').strip().lower()
+        if name_key:
+            shared_drive_name_cache[name_key] = response
+        return response.get('name')
+    return None
+
+
+def fetch_folder_metadata(folder_id):
+    global folder_cache
+    cached = folder_cache.get(folder_id)
+    if isinstance(cached, dict) and 'title' in cached and 'parents' in cached and 'driveId' in cached:
+        return cached
+    file_obj = drive.CreateFile({'id': folder_id})
+    file_obj['supportsAllDrives'] = True
+    try:
+        file_obj.FetchMetadata(fields='id,title,parents,driveId')
+    except Exception as e:
+        logging.error('Failed to fetch metadata for folder ID %s: %s', folder_id, e)
+        return None
+    metadata = {
+        'title': file_obj.get('title', ''),
+        'parents': file_obj.get('parents', []),
+        'driveId': file_obj.get('driveId'),
+    }
+    folder_cache[folder_id] = metadata
+    return metadata
 
 def add_long_path_prefix(path):
     """
@@ -199,155 +295,161 @@ def parse_date_input(date_str):
 def find_folder_id(drive_path, starting_folder_id='root'):
     """
     Find the folder ID in Google Drive based on a relative path.
-    
-    If the drive_path comes from a Drive for Desktop mount and starts with
-    ".shortcut-targets-by-id", then the first two segments are interpreted as the
-    drive_id and its local alias. The online folder title (which may contain a colon)
-    is retrieved and used instead of the local alias.
-    
-    The function first tries an exact match. If that fails, it falls back to word-based
-    search. If no match is found for a segment, a warning is logged and that segment is skipped.
+
+    Supports Drive for Desktop shortcut mounts and explicitly prefixed shared
+    drives (e.g., 'Shared drives/Team/Folder'). The function first tries an
+    exact match, then falls back to word-based search. If a segment cannot be
+    resolved, it is skipped after logging the available options.
     """
     global folder_cache
-    # Split the incoming path into segments.
-    segments = drive_path.split(os.path.sep)
-    
-    # If the path comes from a .shortcut-targets-by-id mount,
-    # then the structure is: [".shortcut-targets-by-id", drive_id, local_alias, ...]
-    if segments[0] == ".shortcut-targets-by-id" and len(segments) >= 3:
+    if not drive_path:
+        return starting_folder_id
+
+    cached_value = folder_cache.get(drive_path)
+    if isinstance(cached_value, str):
+        return cached_value
+
+    cache_path = drive_path
+    segments = [segment for segment in drive_path.split(os.path.sep) if segment]
+    if not segments:
+        folder_cache[cache_path] = starting_folder_id
+        return starting_folder_id
+
+    folder_id = starting_folder_id
+    segments_to_process = list(segments)
+
+    if segments[0] == '.shortcut-targets-by-id' and len(segments) >= 3:
         drive_id = segments[1]
-        # Retrieve the online title for the drive_id folder.
-        try:
-            folder = drive.CreateFile({'id': drive_id})
-            folder.FetchMetadata(fields="title")
-            online_title = folder.get('title', '')
-        except Exception as e:
-            logging.warning("Failed to fetch online title for drive ID %s: %s", drive_id, e)
-            online_title = segments[2]  # Fallback to the local alias.
-        # Replace the local alias with the online title.
-        segments = segments[2:]
-        if segments:
-            segments[0] = online_title
-        # Set the starting folder to be the drive_id folder.
+        metadata = fetch_folder_metadata(drive_id)
+        if metadata:
+            online_title = metadata.get('title', segments[2])
+        else:
+            logging.warning('Failed to fetch online title for drive ID %s', drive_id)
+            online_title = segments[2]
+        segments_to_process = segments[2:]
+        if segments_to_process:
+            segments_to_process[0] = online_title
+        cache_path = os.path.sep.join(segments_to_process)
         folder_id = drive_id
-        drive_path = os.path.sep.join(segments)
+    elif segments[0].strip().lower() in SHARED_DRIVE_MARKERS:
+        if len(segments) < 2:
+            logging.error('Shared drive name missing in path: %s', drive_path)
+            print(f"?? Shared drive name missing in path: {drive_path}")
+            folder_cache[cache_path] = starting_folder_id
+            return starting_folder_id
+        shared_drive_name = segments[1].strip()
+        shared_drive = get_shared_drive_metadata_by_name(shared_drive_name)
+        if not shared_drive:
+            logging.error("Shared drive '%s' not found.", shared_drive_name)
+            print(f"?? Shared drive '{shared_drive_name}' not found.")
+            folder_cache[cache_path] = starting_folder_id
+            return starting_folder_id
+        folder_id = shared_drive.get('id', starting_folder_id)
+        segments_to_process = segments[2:]
     else:
-        folder_id = starting_folder_id
+        segments_to_process = segments
 
-    # Utility for normalization: replace colon with space, collapse whitespace, and lowercase.
     def normalize(title):
-        return re.sub(r'\s+', ' ', title.replace(':', ' ')).strip().lower()
+        return re.sub(r"\s+", " ", title.replace(":", " ")).strip().lower()
 
-    # Process each segment in the (possibly modified) drive_path.
-    for folder_name in drive_path.split(os.path.sep):
+    for folder_name in segments_to_process:
         if not folder_name:
             continue
 
-        # If current folder is not root, check whether it already matches the target.
+        metadata = None
+        current_title = ''
         if folder_id != 'root':
-            try:
-                current_folder = drive.CreateFile({'id': folder_id})
-                current_folder.FetchMetadata(fields="title")
-                current_title = current_folder.get('title', '')
-            except Exception as e:
-                logging.warning("Unable to fetch metadata for folder ID %s: %s", folder_id, e)
-                current_title = ''
-            if normalize(current_title) == normalize(folder_name):
-                logging.info("Current folder '%s' already matches '%s'; skipping search", current_title, folder_name)
-                print(f"✅ Current folder '{current_title}' already matches '{folder_name}'; skipping search")
-                continue
+            metadata = fetch_folder_metadata(folder_id)
+            if metadata:
+                current_title = metadata.get('title', '')
+        if metadata and normalize(current_title) == normalize(folder_name):
+            logging.info("Current folder '%s' already matches '%s'; skipping search", current_title, folder_name)
+            print(f"? Current folder '{current_title}' already matches '{folder_name}'; skipping search")
+            continue
 
-        logging.info("Looking for folder: %s under %s", folder_name, folder_id)
-        print(f"📂 Looking for folder: {folder_name} under {folder_id}")
+        logging.info('Looking for folder: %s under %s', folder_name, folder_id)
+        print(f"?? Looking for folder: {folder_name} under {folder_id}")
 
-        # Step 1: Try an exact match.
         query = (f"'{folder_id}' in parents and trashed=false and "
                  f"mimeType='application/vnd.google-apps.folder' and title='{folder_name}'")
         try:
-            file_list = drive.ListFile({'q': query}).GetList()
+            file_list = list_drive_files({'q': query})
         except Exception as e:
-            logging.error("Exact match query failed: %s", e)
-            print(f"⚠️ Exact match query failed: {e}")
+            logging.error('Exact match query failed: %s', e)
+            print(f"?? Exact match query failed: {e}")
             file_list = []
 
-        # Step 1b: If no result and folder_name doesn't contain ":" but has multiple spaces,
-        # try restoring the colon.
-        if not file_list and (':' not in folder_name) and re.search(r'\s{2,}', folder_name):
-            alt_name = re.sub(r'\s{2,}', ': ', folder_name)
-            logging.info("Exact match with alternative name '%s'", alt_name)
-            print(f"🔍 Trying alternative name: '{alt_name}'")
+        if not file_list and (':' not in folder_name) and re.search(r"\s{2,}", folder_name):
+            alt_name = re.sub(r"\s{2,}", ': ', folder_name)
+            logging.info('Exact match retry with colon: %s', alt_name)
+            print(f"?? Exact match retry with colon: {alt_name}")
             query = (f"'{folder_id}' in parents and trashed=false and "
                      f"mimeType='application/vnd.google-apps.folder' and title='{alt_name}'")
             try:
-                file_list = drive.ListFile({'q': query}).GetList()
+                file_list = list_drive_files({'q': query})
             except Exception as e:
-                logging.error("Exact match alternative query failed: %s", e)
-                print(f"⚠️ Exact match alternative query failed: {e}")
+                logging.error('Exact match alternative query failed: %s', e)
+                print(f"?? Exact match alternative query failed: {e}")
                 file_list = []
 
-        # Step 2: If still no match and folder_name contains special characters, try word-based search.
-        if not file_list and any(char in folder_name for char in ' :;,_-'):
+        if not file_list and any(char in folder_name for char in " :;,_-"):
             logging.info("Exact match failed for '%s', attempting word-based search", folder_name)
-            print(f"🔍 Exact match failed for '{folder_name}', attempting word-based search")
-            
-            words = [word.strip() for word in re.split(r'[\s:;,_-]+', folder_name) if word.strip()]
+            print(f"?? Exact match failed for '{folder_name}', attempting word-based search")
+            words = [word.strip() for word in re.split(r"[\s:;,_-]+", folder_name) if word.strip()]
             if not words:
-                logging.error("No valid words in folder name: %s", folder_name)
-                print(f"⚠️ No valid words in folder name: {folder_name}")
+                logging.error('No valid words in folder name: %s', folder_name)
+                print(f"?? No valid words in folder name: {folder_name}")
                 continue
-            
             search_terms = ' '.join(words)
             query = (f"'{folder_id}' in parents and trashed=false and "
                      f"mimeType='application/vnd.google-apps.folder' and title contains '{search_terms}'")
-            logging.info("Word-based query: %s", query)
-            print(f"🔍 Word-based query: {query}")
+            logging.info('Word-based query: %s', query)
+            print(f"?? Word-based query: {query}")
             try:
-                file_list = drive.ListFile({'q': query}).GetList()
+                file_list = list_drive_files({'q': query})
                 target_length = sum(len(word) for word in words)
                 matches = []
-                pattern = ".*".join(re.escape(word) for word in words)
+                pattern = '.*'.join(re.escape(word) for word in words)
                 for folder in file_list:
                     folder_title = folder['title']
-                    folder_words = [w for w in re.split(r'[\s:;,_-]+', folder_title) if w]
+                    folder_words = [w for w in re.split(r"[\s:;,_-]+", folder_title) if w]
                     folder_length = sum(len(w) for w in folder_words)
                     if folder_length == target_length and re.search(pattern, folder_title, re.IGNORECASE):
                         matches.append(folder)
-                
                 if matches:
                     if len(matches) > 1:
                         logging.warning("Multiple matches for '%s' under %s: %s. Using first match.",
                                         folder_name, folder_id, [f['title'] for f in matches])
-                        print(f"⚠️ Multiple matches for '{folder_name}' under {folder_id}: {[f['title'] for f in matches]}. Using first match.")
+                        print(f"?? Multiple matches for '{folder_name}' under {folder_id}: {[f['title'] for f in matches]}. Using first match.")
                     file_list = [matches[0]]
                 else:
                     file_list = []
             except Exception as e:
-                logging.error("Word-based search failed: %s", e)
-                print(f"⚠️ Word-based search failed: {e}")
+                logging.error('Word-based search failed: %s', e)
+                print(f"?? Word-based search failed: {e}")
                 file_list = []
 
-        # Step 3: If still no match, list all subfolders for debugging and skip this segment.
         if not file_list:
             all_folders_query = (f"'{folder_id}' in parents and trashed=false and "
                                  f"mimeType='application/vnd.google-apps.folder'")
             try:
-                all_folders = drive.ListFile({'q': all_folders_query}).GetList()
+                all_folders = list_drive_files({'q': all_folders_query})
                 available = [f['title'] for f in all_folders]
                 logging.error("No matching folder found for '%s' under %s. Available folders: %s",
                               folder_name, folder_id, available)
-                print(f"⚠️ No matching folder found for '{folder_name}' under {folder_id}. Available folders: {available}")
+                print(f"?? No matching folder found for '{folder_name}' under {folder_id}. Available folders: {available}")
             except Exception as e:
-                logging.error("Failed to list subfolders: %s", e)
-                print(f"⚠️ Failed to list subfolders: {e}")
+                logging.error('Failed to list subfolders: %s', e)
+                print(f"?? Failed to list subfolders: {e}")
             logging.warning("Skipping folder segment '%s'", folder_name)
-            print(f"⚠️ Skipping folder segment '{folder_name}'")
+            print(f"?? Skipping folder segment '{folder_name}'")
             continue
-        
+
         folder_id = file_list[0]['id']
         logging.info("Found folder '%s', ID: %s", file_list[0]['title'], folder_id)
-        print(f"✅ Found folder '{file_list[0]['title']}', ID: {folder_id}")
-    
-    folder_cache[drive_path] = folder_id
+        print(f"? Found folder '{file_list[0]['title']}', ID: {folder_id}")
+
+    folder_cache[cache_path] = folder_id
     return folder_id
 
 def strip_duplicate_suffix(filename):
@@ -377,7 +479,7 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
     if older_than:
         query += f" and modifiedDate < '{older_than}'"
     
-    file_list = drive.ListFile({'q': query}).GetList()
+    file_list = list_drive_files({'q': query})
     matching_files = [f for f in file_list if f['mimeType'] in mime_types]
     folders = [f for f in file_list if f['mimeType'] == 'application/vnd.google-apps.folder']
     files_by_title = {}
@@ -410,45 +512,56 @@ def find_files_in_drive(drive, folder_id, base_path="", filename=None, depth=0, 
 def get_file_drive_path(file_meta):
     """
     Given a file's metadata, compute a relative folder path representing its location in Drive.
-    If the top-level folder is "My Drive", it is removed; otherwise, "Shared With Me" is prepended.
+    If the top-level folder is 'My Drive', it is removed; otherwise, the path is
+    prefixed with either 'Shared drives' (when applicable) or 'Shared With Me'.
     Folder names are sanitized.
     """
-    parents = file_meta.get("parents", [])
+    parents = file_meta.get('parents', [])
     if not parents:
-        return ""
-    parent_id = parents[0]["id"] if isinstance(parents[0], dict) else parents[0]
+        return ''
+    parent_id = parents[0]['id'] if isinstance(parents[0], dict) else parents[0]
     path_parts = []
-    while parent_id and parent_id != "root":
-        if parent_id in folder_cache:
-            folder_info = folder_cache[parent_id]
-        else:
-            folder = drive.CreateFile({'id': parent_id})
-            folder['supportsAllDrives'] = True  # FIX: Support shared drives
-            try:
-                folder.FetchMetadata(fields="id,title,parents")
-            except Exception as e:
-                logging.error("Failed to fetch metadata for parent ID %s: %s", parent_id, e)
+    root_drive_id = None
+
+    while parent_id and parent_id != 'root':
+        folder_info = folder_cache.get(parent_id)
+        if not isinstance(folder_info, dict) or 'driveId' not in folder_info:
+            folder_info = fetch_folder_metadata(parent_id)
+            if not folder_info:
                 break
-            folder_info = {
-                "title": folder["title"],
-                "parents": folder.get("parents", [])
-            }
-            folder_cache[parent_id] = folder_info
-        sanitized_title = sanitize_filename(folder_info["title"])
-        path_parts.append(sanitized_title)
-        if folder_info["parents"]:
-            parent_id = folder_info["parents"][0]["id"] if isinstance(folder_info["parents"][0], dict) else folder_info["parents"][0]
-        else:
+        sanitized_title = sanitize_filename(folder_info['title'])
+        path_parts.append((sanitized_title, folder_info.get('driveId')))
+        parent_refs = folder_info.get('parents', [])
+        if not parent_refs:
+            root_drive_id = folder_info.get('driveId')
             break
-    reversed_path = list(reversed(path_parts))
-    if reversed_path:
-        if reversed_path[0] == "My Drive":
-            reversed_path = reversed_path[1:]
+        parent_ref = parent_refs[0]
+        if isinstance(parent_ref, dict):
+            if parent_ref.get('isRoot'):
+                root_drive_id = folder_info.get('driveId', root_drive_id)
+            parent_id = parent_ref.get('id')
         else:
-            reversed_path.insert(0, "Shared With Me")
-    if not reversed_path:
-        return ""
-    return os.path.join(*reversed_path)
+            parent_id = parent_ref
+
+    reversed_parts = list(reversed(path_parts))
+    titles_only = [title for title, _ in reversed_parts]
+
+    if titles_only:
+        if titles_only[0] == 'My Drive':
+            titles_only = titles_only[1:]
+        else:
+            drive_id = root_drive_id or (reversed_parts[0][1] if reversed_parts else None)
+            if drive_id:
+                shared_drive_name = get_shared_drive_name(drive_id) or titles_only[0]
+                if shared_drive_name:
+                    titles_only[0] = sanitize_filename(shared_drive_name)
+                titles_only.insert(0, 'Shared drives')
+            else:
+                titles_only.insert(0, 'Shared With Me')
+
+    if not titles_only:
+        return ''
+    return os.path.join(*titles_only)
 
 def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
                                       output_directory, dry_run=False, file_meta=None,
@@ -465,6 +578,15 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
       - Also, skip downloading if a file already exists that shares the same modified time.
     """
     meta = file_meta if file_meta else drive.CreateFile({'id': file_id})
+    meta['supportsAllDrives'] = True
+    meta['supportsTeamDrives'] = True
+    if file_meta is None:
+        try:
+            meta.FetchMetadata(fields='id,title,mimeType,modifiedDate,parents,driveId')
+        except Exception as e:
+            logging.error('Failed to fetch metadata for %s: %s', file_id, e)
+            print(f"?? Failed to fetch metadata for {file_id}: {e}")
+            return
     logging.info("Retrieved file: %s (ID: %s, MIME: %s)", meta['title'], file_id, meta['mimeType'])
     print(f"📄 Found File: {meta['title']} (ID: {file_id})")
     print(f"🔍 MIME Type: {meta['mimeType']}")
@@ -546,6 +668,8 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
     try:
         if not dry_run:
             file_to_download = drive.CreateFile({'id': file_id})
+            file_to_download['supportsAllDrives'] = True
+            file_to_download['supportsTeamDrives'] = True
             file_to_download.GetContentFile(add_long_path_prefix(new_target), mimetype=export_mimetype)
             logging.info("Download successful: %s", new_target)
             print(f"✅ File downloaded successfully: {new_target}")
@@ -640,7 +764,7 @@ def process_global_search(add_timestamp, backup_path, dry_run, max_depth, newer_
     if older_than:
         query += f" and modifiedDate < '{older_than}'"
 
-    file_list = drive.ListFile({'q': query}).GetList()
+    file_list = list_drive_files({'q': query})
     output_directory = os.path.abspath(backup_path) if backup_path else os.getcwd()
     try:
         if not dry_run:
@@ -782,7 +906,7 @@ def backup_standalone_scripts(backup_directory, dry_run):
 
     query = "mimeType='application/vnd.google-apps.script' and trashed=false"
     try:
-        script_files = drive.ListFile({'q': query}).GetList()
+        script_files = list_drive_files({'q': query})
     except Exception as e:
         print(f"⚠️ Error querying standalone script projects: {e}")
         return
