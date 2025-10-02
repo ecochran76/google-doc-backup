@@ -11,6 +11,7 @@ import logging
 import argparse
 import subprocess
 import shutil
+import io
 from datetime import datetime, timedelta
 
 try:
@@ -22,6 +23,7 @@ except ImportError:
 from pydrive.auth import GoogleAuth
 from pydrive.drive import GoogleDrive
 from googleapiclient.discovery import build  # FIX: Import for v3 service to fetch shared drive names
+from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 
 # Get the absolute path of the script directory
@@ -107,6 +109,38 @@ shared_drive_id_cache = {}
 shared_drive_name_cache = {}
 
 
+def normalize_local_drive_path(local_path):
+    """Derive a Drive-relative path (e.g. 'Shared drives/Team') from a local Drive for desktop path."""
+    if not local_path:
+        return ''
+    normalized = os.path.normpath(local_path)
+    parts = [segment for segment in normalized.split(os.path.sep) if segment]
+    lowered = [segment.strip().lower() for segment in parts]
+
+    def rebuild(start_index, prefix=None):
+        remainder = parts[start_index + 1:]
+        if prefix is None:
+            return os.path.join(*remainder) if remainder else ''
+        return os.path.join(prefix, *remainder) if remainder else prefix
+
+    if '.shortcut-targets-by-id' in lowered:
+        idx = lowered.index('.shortcut-targets-by-id')
+        return os.path.join(*parts[idx:])
+
+    for marker in SHARED_DRIVE_MARKERS:
+        marker_lower = marker.lower()
+        if marker_lower in lowered:
+            idx = lowered.index(marker_lower)
+            return rebuild(idx, 'Shared drives')
+
+    for candidate in ('my drive', 'drive'):
+        if candidate in lowered:
+            idx = lowered.index(candidate)
+            return rebuild(idx, None)
+
+    return os.path.relpath(normalized, os.path.dirname(normalized))
+
+
 def list_drive_files(params):
     merged = dict(ALL_DRIVES_PARAMS)
     if params:
@@ -176,18 +210,36 @@ def fetch_folder_metadata(folder_id):
     cached = folder_cache.get(folder_id)
     if isinstance(cached, dict) and 'title' in cached and 'parents' in cached and 'driveId' in cached:
         return cached
-    file_obj = drive.CreateFile({'id': folder_id})
-    file_obj['supportsAllDrives'] = True
-    try:
-        file_obj.FetchMetadata(fields='id,title,parents,driveId')
-    except Exception as e:
-        logging.error('Failed to fetch metadata for folder ID %s: %s', folder_id, e)
-        return None
-    metadata = {
-        'title': file_obj.get('title', ''),
-        'parents': file_obj.get('parents', []),
-        'driveId': file_obj.get('driveId'),
-    }
+    metadata = None
+    if drive_v3 is not None:
+        try:
+            response = drive_v3.files().get(
+                fileId=folder_id,
+                fields='id,name,parents,driveId',
+                supportsAllDrives=True
+            ).execute()
+        except HttpError as e:
+            logging.error('Failed to fetch metadata via Drive v3 for folder ID %s: %s', folder_id, e)
+        else:
+            metadata = {
+                'title': response.get('name', ''),
+                'parents': response.get('parents', []),
+                'driveId': response.get('driveId'),
+            }
+    if metadata is None:
+        file_obj = drive.CreateFile({'id': folder_id})
+        file_obj['supportsAllDrives'] = True
+        file_obj['supportsTeamDrives'] = True
+        try:
+            file_obj.FetchMetadata(fields='id,title,parents,driveId')
+        except Exception as e:
+            logging.error('Failed to fetch metadata for folder ID %s: %s', folder_id, e)
+            return None
+        metadata = {
+            'title': file_obj.get('title', ''),
+            'parents': file_obj.get('parents', []),
+            'driveId': file_obj.get('driveId'),
+        }
     folder_cache[folder_id] = metadata
     return metadata
 
@@ -563,6 +615,25 @@ def get_file_drive_path(file_meta):
         return ''
     return os.path.join(*titles_only)
 
+def export_google_file_via_v3(file_id, export_mimetype, destination_path):
+    """Export a Google-native file using the Drive v3 API with shared-drive support."""
+    if drive_v3 is None:
+        raise RuntimeError('Drive v3 service is not initialized')
+    request = drive_v3.files().export_media(
+        fileId=file_id,
+        mimeType=export_mimetype
+    )
+    if 'supportsAllDrives' not in request.uri:
+        separator = '&' if '?' in request.uri else '?'
+        request.uri = f"{request.uri}{separator}supportsAllDrives=true&supportsTeamDrives=true"
+    with io.FileIO(add_long_path_prefix(destination_path), 'wb') as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            # status can be None for small files; no progress logging needed.
+    return destination_path
+
 def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path, add_timestamp,
                                       output_directory, dry_run=False, file_meta=None,
                                       prune_newest=None, prune_staggered=None, no_clobber=False):
@@ -667,10 +738,13 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
     print(f"{'[Dry Run] Would save' if dry_run else '⬇️  Saving'} as: {new_target}")
     try:
         if not dry_run:
-            file_to_download = drive.CreateFile({'id': file_id})
-            file_to_download['supportsAllDrives'] = True
-            file_to_download['supportsTeamDrives'] = True
-            file_to_download.GetContentFile(add_long_path_prefix(new_target), mimetype=export_mimetype)
+            try:
+                export_google_file_via_v3(file_id, export_mimetype, new_target)
+            except RuntimeError:
+                file_to_download = drive.CreateFile({'id': file_id})
+                file_to_download['supportsAllDrives'] = True
+                file_to_download['supportsTeamDrives'] = True
+                file_to_download.GetContentFile(add_long_path_prefix(new_target), mimetype=export_mimetype)
             logging.info("Download successful: %s", new_target)
             print(f"✅ File downloaded successfully: {new_target}")
             # Update local file modification time to match Google's modifiedDate.
@@ -805,7 +879,7 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
         if os.path.isdir(input_path):
             logging.info("Input is a directory: %s", input_path)
             print(f"📁 Processing directory: {input_path}")
-            drive_path = os.path.relpath(input_path, "H:\\My Drive")
+            drive_path = normalize_local_drive_path(input_path)
             folder_id = find_folder_id(drive_path)
             files_by_title = find_files_in_drive(drive, folder_id, max_depth=max_depth,
                                                  newer_than=newer_than, older_than=older_than)
@@ -838,7 +912,7 @@ def process_path(input_path, add_timestamp, backup_path, dry_run, max_depth, new
                 logging.error("Unsupported file type: %s", file_extension)
                 print(f"⚠️ Unsupported file type: {file_extension}")
                 return
-            drive_path = os.path.relpath(folder_path, "H:\\My Drive")
+            drive_path = normalize_local_drive_path(folder_path)
             folder_id = find_folder_id(drive_path)
             files_by_title = find_files_in_drive(drive, folder_id, filename=filename,
                                                  max_depth=max_depth, newer_than=newer_than, older_than=older_than)
@@ -966,7 +1040,7 @@ def parse_arguments():
 
 
 def main():
-    print("🚀 Script started!")
+    print("Script started!")
     args = parse_arguments()
     # Process the --newer-than argument:
     if args.newer_than:

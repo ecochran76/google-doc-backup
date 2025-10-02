@@ -10,6 +10,9 @@
 - **Backup Organization:**  
   Preserve your Google Drive folder structure when saving files locally.
 
+- **Shared Drive Awareness:**  
+  Include files that live in Google Shared Drives; global backups recreate the `Shared drives/<Drive Name>/…` hierarchy alongside content from My Drive.
+
 - **Version Control Options:**  
   - Append a timestamp to downloaded files (`--timestamp`). The timestamp is taken from the Google Drive file's modified date rather than the current time.
   - Automatically rename existing files to backups using their Google Drive modified timestamp.
@@ -148,6 +151,14 @@ google-doc-backup [options] [paths...]
   ```bash
   google-doc-backup --backup "E:\SyncThing\Cloud\Google"
   ```
+
+### Windows Console Encoding
+
+On Windows consoles that default to cp1252, set `PYTHONIOENCODING=utf-8` before launching the CLI so emoji log messages do not trigger `UnicodeEncodeError`. For example:
+
+```cmd
+set PYTHONIOENCODING=utf-8 && python download_google_doc.pyw --backup "E:\Backups\Drive"
+```
 
 ## Authentication
 

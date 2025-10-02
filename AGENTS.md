@@ -5,6 +5,7 @@ The root directory holds the operational scripts. `download_google_doc.pyw` is t
 
 ## Build, Test, and Development Commands
 Create a virtual environment and install runtime dependencies with `python -m venv .venv`, `.venv\Scripts\activate`, and `pip install -r requirements.txt`. For editable work, run `pip install -e .` so the CLIs resolve correctly. Use `python download_google_doc.pyw --help` to review options and `python download_google_doc.pyw --dry-run --backup "D:\Backups\Drive"` for safe validation. The Apps Script backup path depends on `clasp`; verify setup inside a project folder with `npx clasp status`.
+On Windows consoles that default to cp1252, set `PYTHONIOENCODING=utf-8` before running CLI commands so emoji log messages don't trigger UnicodeEncodeError (e.g. `set PYTHONIOENCODING=utf-8 && python download_google_doc.pyw ...`).
 
 ## Coding Style & Naming Conventions
 Follow PEP 8: four-space indentation, `snake_case` for functions and variables, and uppercase constants for paths (e.g., `CLIENT_SECRETS_PATH`). Keep functions focused; prefer extracting helpers instead of extending the main script. Favor structured `logging` calls over prints, and document any Windows-only behavior in inline comments.
