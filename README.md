@@ -21,6 +21,12 @@ Google-native files are exported as:
 - Sheets: `.xlsx`
 - Slides: `.pptx`
 
+Backup filenames include a source marker before the Office extension, such as
+`Report.gdoc.docx`, `Data.gsheet.xlsx`, or `Deck.gslides.pptx`. If a
+Google-native file title already ends with the same Office extension, that
+title suffix is stripped first so `Deck.pptx` becomes `Deck.gslides.pptx`, not
+`Deck.pptx.gslides.pptx`.
+
 Each run writes a JSON manifest under the tenant state directory so service runs can be audited without reading the backup tree directly.
 
 ## Install

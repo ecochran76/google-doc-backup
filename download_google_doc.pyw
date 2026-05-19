@@ -753,6 +753,18 @@ def get_export_extension(export_mime_type):
     }
     return mapping.get(export_mime_type, '')
 
+def strip_matching_export_extension(title, export_extension):
+    """
+    Remove a misleading Office extension from a Google-native file title before
+    adding the source marker and export extension.
+    """
+    if not export_extension:
+        return title
+    suffix = f".{export_extension}"
+    if title.lower().endswith(suffix.lower()):
+        return title[:-len(suffix)]
+    return title
+
 def parse_date_input(date_str):
     """
     Parse a date string into RFC 3339 UTC format.
@@ -1507,7 +1519,8 @@ def download_google_file_as_ms_office(file_id, suffix, mime_type, subfolder_path
         logging.error("Failed to create directory %s: %s", full_output_directory, e)
         print(f"⚠️  Failed to create directory {full_output_directory}: {e}")
         return
-    base_name = f"{sanitize_filename(meta['title'])}{suffix}{'.' + orig_ext}"
+    title_without_export_ext = strip_matching_export_extension(meta['title'], file_extension)
+    base_name = f"{sanitize_filename(title_without_export_ext)}{suffix}{'.' + orig_ext}"
     plain_target = os.path.join(full_output_directory, f"{base_name}.{file_extension}")
 
     # Determine timestamp from the Google file's modifiedDate.
