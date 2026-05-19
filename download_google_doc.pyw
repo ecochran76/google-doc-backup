@@ -1151,10 +1151,29 @@ def print_doctor_report(report, output_format):
 
 def render_user_service_files(runtime_config, on_calendar):
     uv_bin = shutil.which("uv") or "uv"
+    gws_bin = shutil.which("gws")
     repo_root = SCRIPT_DIR
     script_path = os.path.join(SCRIPT_DIR, "download_google_doc.pyw")
     service_name = f"{APP_NAME}@{runtime_config.tenant}.service"
     timer_name = f"{APP_NAME}@{runtime_config.tenant}.timer"
+    service_path_parts = []
+    home = str(Path.home())
+    for value in [
+        os.path.dirname(uv_bin) if os.path.isabs(uv_bin) else None,
+        os.path.dirname(gws_bin) if gws_bin and os.path.isabs(gws_bin) else None,
+        os.path.join(home, ".cargo", "bin"),
+        os.path.join(home, ".local", "bin"),
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/home/linuxbrew/.linuxbrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]:
+        if not value:
+            continue
+        if value not in service_path_parts:
+            service_path_parts.append(value)
+    service_path = os.pathsep.join(service_path_parts)
     service_content = f"""[Unit]
 Description=Google Docs backup for tenant {runtime_config.tenant}
 Wants=network-online.target
@@ -1163,6 +1182,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory={repo_root}
+Environment="PATH={service_path}"
 ExecStart={uv_bin} run python {script_path} --tenant {runtime_config.tenant} --backend auto --no-scripts
 """
     timer_content = f"""[Unit]
