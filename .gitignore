@@ -7,5 +7,7 @@ client_secrets.json
 *.log
 *.reg
 package*.json
+__pycache__/
+.venv/
 
 

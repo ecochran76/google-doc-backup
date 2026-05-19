@@ -1,0 +1,19 @@
+[project]
+name = "google-doc-backup"
+version = "0.1.0"
+description = "Back up Google Docs, Sheets, Slides, and Apps Script projects."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-api-python-client>=2.170.0",
+    "pydrive>=1.3.1",
+    "python-dateutil>=2.9.0.post0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[tool.uv]
+package = false

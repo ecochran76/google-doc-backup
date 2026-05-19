@@ -1,177 +1,201 @@
-# google_doc_backup
+# google-doc-backup
 
-**google_doc_backup** is a command-line tool that backs up your Google Docs, Sheets, and Slides to Microsoft Office formats (DOCX, XLSX, and PPTX). It uses PyDrive to authenticate with Google Drive, supports global searches based on date and title filters, and organizes files in your backup directory by their Google Drive folder hierarchy. It also includes optional version control features such as timestamping, backup pruning, and a no‑clobber mode to prevent re‑downloading of existing files.
+`google-doc-backup` exports Google Docs, Sheets, and Slides into local Office-format backups. The current service path is tenant-scoped, `uv`-managed, and prefers the local `gws` Google Workspace CLI with the legacy direct Google API path kept as a fallback.
 
-## Features
+The default local backup target is:
 
-- **File Conversion:**  
-  Download Google Docs as DOCX, Google Sheets as XLSX, and Google Slides as PPTX.
-
-- **Backup Organization:**  
-  Preserve your Google Drive folder structure when saving files locally.
-
-- **Shared Drive Awareness:**  
-  Include files that live in Google Shared Drives; global backups recreate the `Shared drives/<Drive Name>/…` hierarchy alongside content from My Drive.
-
-- **Version Control Options:**  
-  - Append a timestamp to downloaded files (`--timestamp`). The timestamp is taken from the Google Drive file's modified date rather than the current time.
-  - Automatically rename existing files to backups using their Google Drive modified timestamp.
-  - Retain a specified number of backups using either a staggered or newest-pruning strategy (`--staggered` or `--newest`).
-  - Optionally prevent re‑downloading of files if they already exist (`--no‑clobber`).
-
-- **Accurate Timestamps and Redundancy Checks:**  
-  - The tool sets the downloaded file’s modification time to match that on Google Drive.
-  - When timestamping is enabled, the appended timestamp reflects the Google Drive modified date.
-  - Files are skipped if a local copy exists with an identical modified time (within a one‑second tolerance).
-
-- **Global Search:**  
-  Perform searches across your entire Drive based on modification dates (`--newer-than` / `--older-than`) and title (`--title`).
-
-- **Long Path Support (Windows):**  
-  Handles file paths longer than 260 characters by automatically prepending the Windows extended-length prefix.
-
-- **Standalone Apps Script Backup:**  
-  - Back up your standalone Google Apps Script projects using CLASP.
-  - A dedicated `AppScript` folder is created in your backup directory, with each script project placed in its own subfolder.
-  - If a project’s subfolder is new or missing the CLASP configuration file (`.clasp.json`), the tool performs an initial clone from that subfolder.
-  - If the subfolder already exists and contains a `.clasp.json` file, the tool executes a pull to update the project.
-  - Use the `--no-scripts` flag to suppress standalone script backups.
-
-## Installation
-
-1. **Clone the Repository:**
-
-   ```bash
-   git clone https://github.com/yourusername/google_doc_backup.git
-   cd google_doc_backup
-   ```
-
-2. **Install in Editable Mode:**
-
-   ```bash
-   pip install -e .
-   ```
-
-   Alternatively, if published to PyPI:
-
-   ```bash
-   pip install google_doc_backup
-   ```
-
-3. **Install Dependencies:**
-
-   Ensure that the required packages are installed (listed in `requirements.txt`):
-
-   ```bash
-   pip install pydrive python-dateutil
-   ```
-
-## Obtaining client_secrets.json
-
-This tool uses the Google Drive API for accessing your files. To authenticate, you need a `client_secrets.json` file:
-
-1. Visit the [Google Developers Console](https://console.developers.google.com/).
-2. Create a new project (or select an existing one).
-3. Enable the **Google Drive API** for your project.
-4. Go to **Credentials** and click on **Create Credentials** > **OAuth client ID**.
-5. Configure the consent screen if prompted.
-6. Choose **Desktop app** as the application type.
-7. Download the generated `client_secrets.json` file.
-8. Place the `client_secrets.json` file in the same directory as the script (or in the directory specified by your package).
-
-## Usage
-
-After installation, you can use the package via the command-line interface:
-
-```bash
-google-doc-backup [options] [paths...]
+```text
+/mnt/e/SyncThing/Cloud/Google-Docs
 ```
 
-### Command-Line Options
+## What It Backs Up
 
-- `paths`:  
-  Local file or directory paths (wildcards supported). If omitted, a global Drive search is performed.
+- My Drive, under `My Drive/` when `my_drive_root_mode = "scoped"`.
+- Files shared with the authenticated user, under `Shared With Me/<owner>/`.
+- Shared Drives visible to the authenticated user, under `Shared drives/<drive name>/`.
+- Standalone Apps Script projects under `AppScript/` when `clasp` is installed and scripts are enabled.
 
-- `--timestamp`:  
-  Append the Google file’s modified timestamp to the new file name.
+Google-native files are exported as:
 
-- `--backup <backup_path>`:  
-  Specify a destination directory for backups. Files will be organized into subfolders matching their Drive folder hierarchy.
+- Docs: `.docx`
+- Sheets: `.xlsx`
+- Slides: `.pptx`
 
-- `--no-clobber`:  
-  Do not re‑download a file if it already exists.
+Each run writes a JSON manifest under the tenant state directory so service runs can be audited without reading the backup tree directly.
 
-- `--max-depth <n>`:  
-  Maximum recursion depth for folder search (default: unlimited).
+## Install
 
-- `--newer-than <date>`:  
-  Filter files newer than the specified date. Supports absolute dates (e.g., `2023-01-01T00:00:00`) or relative times (e.g., `-1d`).
+Use `uv` for the Python environment:
 
-- `--older-than <date>`:  
-  Filter files older than the specified date.
+```bash
+uv sync
+uv run python download_google_doc.pyw --help
+```
 
-- `--title <title>`:  
-  Search for files with a specific title (partial match).
+The repo also exposes the historical script entry point directly. Prefer `uv run python download_google_doc.pyw ...` until the CLI is split into importable modules.
 
-- `--staggered <n>`:  
-  Retain up to _n_ timestamped backups in staggered mode.
+## Tenant Configuration
 
-- `--newest <n>`:  
-  Retain up to _n_ most recent timestamped backups.
+Tenant config lives outside the repo:
 
-- `--no-scripts`:  
-  Do not back up standalone Apps Script projects.
+```text
+~/.config/google-doc-backup/tenants/<tenant>.toml
+```
 
-### Examples
+Default state lives outside the repo:
 
-- **Global Search with Versioning:**  
-  Back up files with titles containing "Workouts" modified within the last 30 days. Save backups to `E:\SyncThing\Cloud\Google` using staggered backup retention (up to 5 backups):
+```text
+~/.local/state/google-doc-backup/tenants/<tenant>/
+```
 
-  ```bash
-  google-doc-backup --newer-than="-30d" --backup "E:\SyncThing\Cloud\Google" --staggered=5 --title "Workouts"
-  ```
+Example default tenant config:
 
-- **Prevent Overwrites:**  
-  Skip downloading if the target file already exists with the same modified time:
+```toml
+tenant = "default"
+backend = "auto"
+backup_root = "/mnt/e/SyncThing/Cloud/Google-Docs"
+include_my_drive = true
+include_shared_with_me = true
+include_shared_drives = true
+include_apps_script = true
+my_drive_root_mode = "scoped"
+staggered = 5
+dry_run = false
+```
 
-  ```bash
-  google-doc-backup --no-clobber --backup "E:\SyncThing\Cloud\Google" --title "Report"
-  ```
+Backend modes:
 
-- **Local Directory Processing:**  
-  Back up all files in a local folder (which corresponds to a folder in "My Drive"):
+- `auto`: use `gws` first, then fall back to the direct API path when the `gws` readiness probe fails.
+- `gws`: require `gws`.
+- `direct-api`: use the legacy PyDrive/direct Google API path.
 
-  ```bash
-  google-doc-backup "H:\My Drive\Documents\Reports"
-  ```
+Inspect resolved config without authenticating:
 
-- **Standalone Apps Script Backup:**  
-  Back up your standalone Apps Script projects into the `AppScript` subfolder of your backup directory. To disable script backups, use the `--no-scripts` flag:
+```bash
+uv run python download_google_doc.pyw --tenant default --show-config
+```
 
-  ```bash
-  google-doc-backup --backup "E:\SyncThing\Cloud\Google"
-  ```
+## Operations
 
-### Windows Console Encoding
+Run readiness checks:
 
-On Windows consoles that default to cp1252, set `PYTHONIOENCODING=utf-8` before launching the CLI so emoji log messages do not trigger `UnicodeEncodeError`. For example:
+```bash
+uv run python download_google_doc.pyw --tenant default --doctor
+```
+
+Run a no-write backup plan:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --dry-run --show-config
+```
+
+Run a backup manually:
+
+```bash
+uv run python download_google_doc.pyw --tenant default
+```
+
+Disable Apps Script backup when `clasp` is unavailable:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --no-scripts
+```
+
+Recover local `gws` auth with:
+
+```bash
+gws auth sync-gog
+```
+
+If the shell wrapper cannot find `gog`, set `GWS_GOG_BIN` to the real binary path and retry.
+
+## User Service
+
+Install or update the user-scoped systemd timer:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --install-user-service
+```
+
+Preview generated service files without writing them:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --install-user-service --service-dry-run
+```
+
+The default timer runs daily at `03:30` local time. On this workstation the installed service currently includes `--no-scripts` because `clasp` is optional and was not available during setup.
+
+Inspect the timer:
+
+```bash
+systemctl --user list-timers 'google-doc-backup@default.timer' --no-pager
+```
+
+## Retention
+
+Timestamped backup retention can be configured per tenant or overridden per run:
+
+```toml
+staggered = 5
+```
+
+`staggered = 5` keeps five staggered historical exports per file using the existing retention algorithm. `newest = N` keeps the newest `N` timestamped backups instead; if both are configured, `newest` wins.
+
+CLI overrides:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --staggered 5
+uv run python download_google_doc.pyw --tenant default --newest 5
+```
+
+## Legacy Root Migration
+
+Older backups may have My Drive folders directly at the backup root. Plan a migration into the scoped `My Drive/` root without moving files:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --plan-migrate-my-drive-root
+```
+
+Review JSON output:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --plan-migrate-my-drive-root --migration-plan-format json
+```
+
+Apply only after reviewing a zero-collision plan:
+
+```bash
+uv run python download_google_doc.pyw --tenant default --apply-migrate-my-drive-root
+```
+
+The apply command aborts before moving anything if the backup root is missing or any target path already exists.
+
+## Direct API Fallback
+
+The direct API path still uses local OAuth artifacts:
+
+- `client_secrets.json`
+- `credentials.json`
+
+Keep real credentials out of version control. Regenerate `credentials.json` after permission changes, and prune stale tokens if authentication loops appear.
+
+## Development
+
+Run the narrow validation checks:
+
+```bash
+uv lock --check
+uv run python -m py_compile download_google_doc.pyw
+uv run python download_google_doc.pyw --tenant default --doctor
+uv run python download_google_doc.pyw --tenant default --dry-run --show-config
+```
+
+When adding logic, prefer focused offline `pytest` coverage under `tests/` with fake Drive or backend responses.
+
+## Windows Console Encoding
+
+On Windows consoles that default to cp1252, set `PYTHONIOENCODING=utf-8` before launching the CLI so Unicode log messages do not trigger `UnicodeEncodeError`:
 
 ```cmd
 set PYTHONIOENCODING=utf-8 && python download_google_doc.pyw --backup "E:\Backups\Drive"
 ```
-
-## Authentication
-
-The tool uses PyDrive for authentication. Place your `client_secrets.json` file in the same directory as the script, and the tool will handle credential management automatically. For first-time use, a browser window will open to authorize access to your Google Drive.
-
-## Contributing
-
-Contributions are welcome! Please open issues or submit pull requests on the [GitHub repository](https://github.com/yourusername/google_doc_backup).
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Disclaimer
-
-This tool relies on the Google Drive API, which is subject to change. Use at your own risk and ensure you comply with Google’s API usage policies.
